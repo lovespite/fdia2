@@ -16,6 +16,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     PointCloud,
     VolumeComposite,
     VolumeMip,
+    VolumeHybrid,
   }
 
   enum HudSliderTarget
@@ -221,6 +222,9 @@ public sealed class Fdia3GuiWindow : GameWindow
       case Keys.F3:
         SetRenderMode(RenderMode.VolumeMip);
         break;
+      case Keys.F4:
+        SetRenderMode(RenderMode.VolumeHybrid);
+        break;
       case Keys.C:
         clippingEnabled = !clippingEnabled;
         status = clippingEnabled ? "Clipping enabled" : "Clipping disabled";
@@ -325,16 +329,17 @@ public sealed class Fdia3GuiWindow : GameWindow
       RenderMode.PointCloud => "Switched to point cloud",
       RenderMode.VolumeComposite => "Switched to volume composite",
       RenderMode.VolumeMip => "Switched to volume MIP",
+      RenderMode.VolumeHybrid => "Switched to volume hybrid",
       _ => status,
     };
   }
 
   bool TryBeginHudSliderDrag(Vector2 mousePosition)
   {
-    if (renderMode != RenderMode.VolumeComposite && renderMode != RenderMode.VolumeMip)
+    if (renderMode != RenderMode.VolumeComposite && renderMode != RenderMode.VolumeMip && renderMode != RenderMode.VolumeHybrid)
       return false;
 
-    if (renderMode == RenderMode.VolumeComposite && ContainsRect(densitySliderRectPx, mousePosition))
+    if ((renderMode == RenderMode.VolumeComposite || renderMode == RenderMode.VolumeHybrid) && ContainsRect(densitySliderRectPx, mousePosition))
     {
       activeHudSlider = HudSliderTarget.Density;
       isRotating = false;
@@ -342,7 +347,7 @@ public sealed class Fdia3GuiWindow : GameWindow
       return true;
     }
 
-    if (renderMode == RenderMode.VolumeComposite && ContainsRect(opacitySliderRectPx, mousePosition))
+    if ((renderMode == RenderMode.VolumeComposite || renderMode == RenderMode.VolumeHybrid) && ContainsRect(opacitySliderRectPx, mousePosition))
     {
       activeHudSlider = HudSliderTarget.Opacity;
       isRotating = false;
@@ -544,11 +549,11 @@ public sealed class Fdia3GuiWindow : GameWindow
       $"Points: {pointCount:N0} | Busy: {isBusy}",
       $"Origin(0,0,0): ({ReferenceOrigin.X:F1},{ReferenceOrigin.Y:F1},{ReferenceOrigin.Z:F1})",
       $"Status: {status}",
-      "Keys: F1/F2/F3 Mode | C Clip | [ ] ClipOffset",
+      "Keys: F1-F4 Mode | C Clip | [ ] ClipOffset",
       "      , . Density | - = Opacity | <- -> Preview | R Reset",
     };
 
-    if (renderMode == RenderMode.VolumeComposite)
+    if (renderMode == RenderMode.VolumeComposite || renderMode == RenderMode.VolumeHybrid)
       lines.Add("Composite sliders: drag Density/Opacity bars below");
     else if (renderMode == RenderMode.VolumeMip)
       lines.Add("MIP slider: drag Slice bar below");
@@ -964,7 +969,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     {
       var t = i / 255f;
       var color = EvaluateTransferColor(t);
-      var alpha = Math.Clamp(MathF.Pow(t, 1.65f) * 0.18f, 0f, 1f);
+      var alpha = t; // Linear density for shader physical accumulation
       data[i * 4] = (byte)Math.Clamp((int)MathF.Round(color.X * 255f), 0, 255);
       data[i * 4 + 1] = (byte)Math.Clamp((int)MathF.Round(color.Y * 255f), 0, 255);
       data[i * 4 + 2] = (byte)Math.Clamp((int)MathF.Round(color.Z * 255f), 0, 255);
@@ -1358,7 +1363,12 @@ public sealed class Fdia3GuiWindow : GameWindow
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uVolumeValueScale"), volumeValueScale);
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uOpacityGain"), opacityGain);
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uEarlyTerminateAlpha"), EarlyTerminateAlpha);
-    GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uRenderMode"), renderMode == RenderMode.VolumeMip ? 1 : 0);
+    
+    int shaderMode = 0;
+    if (renderMode == RenderMode.VolumeMip) shaderMode = 1;
+    else if (renderMode == RenderMode.VolumeHybrid) shaderMode = 2;
+    GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uRenderMode"), shaderMode);
+
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uClipEnabled"), clippingEnabled ? 1 : 0);
     GL.Uniform3(GL.GetUniformLocation(volumeShaderProgram, "uClipNormal"), Vector3.UnitY);
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uClipOffset"), clipOffset);
@@ -1501,9 +1511,9 @@ public sealed class Fdia3GuiWindow : GameWindow
     Console.WriteLine("Live status HUD is rendered at top-left (window title is simplified).");
     Console.WriteLine("Reference geometry: infinite-looking +X/+Y/+Z axes and infinite XZ grid.");
     Console.WriteLine("Logic origin (0,0,0) is anchored at world coordinate (-0.5,-0.5,-0.5).");
-    Console.WriteLine("Render modes: F1=PointCloud, F2=Volume Composite, F3=Volume MIP");
+    Console.WriteLine("Render modes: F1=PointCloud, F2=Volume Composite, F3=Volume MIP, F4=Volume Hybrid");
     Console.WriteLine("Volume controls: C=Clip On/Off, [ / ]=Clip Offset, , / .=Density Gain, - / ==Opacity Gain");
-    Console.WriteLine("Composite mode: drag Density/Opacity sliders in the HUD (top-left).");
+    Console.WriteLine("Composite/Hybrid mode: drag Density/Opacity sliders in the HUD (top-left).");
     Console.WriteLine("MIP mode: drag Slice slider in the HUD (top-left).");
     Console.WriteLine("Mouse: Left Drag=Rotate, Wheel=Zoom");
     Console.WriteLine("Keys: Left/A=Previous preview, Right/D=Next preview, R=Reset camera, O=Open output folder, H=Help, Esc=Quit");
