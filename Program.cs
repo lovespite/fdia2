@@ -110,6 +110,7 @@ internal class Program
     Console.WriteLine("fdia3 GUI keys:");
     Console.WriteLine("  Mouse LeftDrag/Wheel rotate/zoom, Left/Right switch preview, R reset camera");
     Console.WriteLine("  Tip: dropping valid .fd3 files loads them directly for rendering");
+    Console.WriteLine("  F1/F2/F3 switch PointCloud/Volume Composite/Volume MIP; (C),([),(]),(,.),(-=) adjust volume view");
   }
 
   static bool ShouldRunGui(string[] args)

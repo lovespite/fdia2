@@ -33,7 +33,7 @@ public sealed class HeatmapGuiWindow : GameWindow
         },
         new NativeWindowSettings
         {
-          Title = "fdia2 GUI (OpenTK)",
+          Title = "fdia2",
           ClientSize = new Vector2i(960, 540)
         })
   {
@@ -85,7 +85,7 @@ public sealed class HeatmapGuiWindow : GameWindow
 
     var clearColor = HeatmapProcessor.ColorMode == ColorMode.Grayscale
       ? new Color4(0.15f, 0.15f, 0.15f, 1f)
-      : new Color4(0.22f, 0.08f, 0.08f, 1f);
+      : new Color4(0.0f, 0.0f, 0.0f, 1f);
 
     GL.ClearColor(clearColor);
     GL.Clear(ClearBufferMask.ColorBufferBit);
@@ -206,7 +206,7 @@ public sealed class HeatmapGuiWindow : GameWindow
     var previewStatus = previewFiles.Count > 0 && previewIndex >= 0
       ? $"{previewIndex + 1}/{previewFiles.Count}"
       : "None";
-    Title = $"fdia2 GUI (OpenTK) | Mode: {HeatmapProcessor.ColorMode} | Scale: {HeatmapProcessor.Scale}x{HeatmapProcessor.Scale} | Pending: {pendingFiles.Count} | Preview: {previewStatus} | Busy: {isBusy} | {status}";
+    Title = $"fdia2 | Mode: {HeatmapProcessor.ColorMode} | Scale: {HeatmapProcessor.Scale}x{HeatmapProcessor.Scale} | Pending: {pendingFiles.Count} | Preview: {previewStatus} | Busy: {isBusy} | {status}";
   }
 
   void NavigatePreview(int delta)

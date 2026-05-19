@@ -6,7 +6,7 @@
     },
     "fdia3": {
       "commandName": "Project",
-      "commandLineArgs": "-3ug D:/test/pictures/*.jpg"
+      "commandLineArgs": "-3ug output/*.fd3"
     }
   }
 }

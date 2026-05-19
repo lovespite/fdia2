@@ -12,7 +12,7 @@ public static unsafe class HeatmapProcessor
 {
   private delegate void WritePixel(byte* pBitmap, int offset, byte intensity);
 
-  public static ColorMode ColorMode { get; set; } = ColorMode.Grayscale;
+  public static ColorMode ColorMode { get; set; } = ColorMode.InfraredThermogram;
 
   public static int Scale { get; set; } = 1;
 
