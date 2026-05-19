@@ -111,7 +111,10 @@ public static unsafe class HeatmapProcessor
 
     var nMax = NLog(max);
 
-    var bitmap = CreateBitmap(out var writer);
+    if (Scale <= 0)
+      throw new InvalidOperationException("Scale must be a positive integer.");
+
+    var bitmap = CreateBitmap(Scale, out var writer);
     var stride = bitmap.RowBytes;
     var bytesPerPixel = bitmap.Info.BytesPerPixel;
     var bitmapData = bitmap.GetPixelSpan();
@@ -125,12 +128,21 @@ public static unsafe class HeatmapProcessor
         {
           var ptr = pMap + y * 256 + x;
           var intensity = (byte)(NLog(*ptr) / nMax * 255);
-          var offset = y * stride + x * bytesPerPixel;
-          writer(pBitmap, offset, intensity);
+          var scaledY = y * Scale;
+          var scaledX = x * Scale;
+          for (int dy = 0; dy < Scale; dy++)
+          {
+            var rowOffset = (scaledY + dy) * stride;
+            for (int dx = 0; dx < Scale; dx++)
+            {
+              var offset = rowOffset + (scaledX + dx) * bytesPerPixel;
+              writer(pBitmap, offset, intensity);
+            }
+          }
         }
       }
     }
-
+    
     var outputFilePath = Path.Combine(
       outputDir,
       Path.GetFileName(filePath) + ".heatmap.png");
@@ -145,16 +157,17 @@ public static unsafe class HeatmapProcessor
     return outputFilePath;
   }
 
-  static SKBitmap CreateBitmap(out WritePixel writer)
+  static SKBitmap CreateBitmap(int scale, out WritePixel writer)
   {
+    var bitmapSize = checked(256 * scale);
     switch (ColorMode)
     {
       case ColorMode.Grayscale:
         writer = WritePixelGray;
-        return new SKBitmap(new SKImageInfo(256, 256, SKColorType.Gray8));
+        return new SKBitmap(new SKImageInfo(bitmapSize, bitmapSize, SKColorType.Gray8));
       case ColorMode.InfraredThermogram:
         writer = WritePixelInfrared;
-        return new SKBitmap(new SKImageInfo(256, 256, SKColorType.Rgb888x));
+        return new SKBitmap(new SKImageInfo(bitmapSize, bitmapSize, SKColorType.Rgb888x));
       default:
         throw new InvalidOperationException("Unsupported color mode: " + ColorMode);
     }

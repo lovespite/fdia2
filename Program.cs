@@ -54,6 +54,9 @@ internal class Program
         case 'i':
           HeatmapProcessor.ColorMode = ColorMode.InfraredThermogram;
           break;
+        case 's':
+          i = ParseScaleOption(expression, i);
+          break;
         case 'u':
           break;
         default:
@@ -63,15 +66,39 @@ internal class Program
     }
   }
 
+  static int ParseScaleOption(ReadOnlySpan<char> expression, int optionIndex)
+  {
+    var valueStart = optionIndex + 1;
+    if (valueStart >= expression.Length || !char.IsDigit(expression[valueStart]))
+    {
+      Console.WriteLine($"WARN! Invalid scale option: '{expression.ToString()}'. Expected '-sN', e.g. '-s2'.");
+      return optionIndex;
+    }
+
+    var valueEnd = valueStart;
+    while (valueEnd < expression.Length && char.IsDigit(expression[valueEnd]))
+      valueEnd++;
+
+    if (!int.TryParse(expression[valueStart..valueEnd], out var scale) || scale <= 0)
+    {
+      Console.WriteLine($"WARN! Invalid scale value in option '{expression.ToString()}'. Scale must be a positive integer.");
+      return valueEnd - 1;
+    }
+
+    HeatmapProcessor.Scale = scale;
+    return valueEnd - 1;
+  }
+
   static void PrintUsage()
   {
     var exeName = Path.GetFileNameWithoutExtension(Environment.GetCommandLineArgs()[0]);
-    Console.WriteLine($"Usage: {exeName} [-u] [-v|g|i] <file1> <file2> ...");
+    Console.WriteLine($"Usage: {exeName} [-u] [-v|g|i] [-sN] <file1> <file2> ...");
     Console.WriteLine("Options:");
     Console.WriteLine("  u, Run in GUI mode (default when no arguments)");
     Console.WriteLine("  v, Open the output directory after processing");
     Console.WriteLine("  g, Use grayscale color mode (default)");
     Console.WriteLine("  i, Use infrared thermogram color mode");
+    Console.WriteLine("  sN, Scale output pixels by N x N (example: -s2)");
     Console.WriteLine();
     Console.WriteLine("GUI quick keys:");
     Console.WriteLine("  G/I switch color mode, F5 process queued files, O open output, Esc quit");
