@@ -6,6 +6,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <PublishAOT>true</PublishAOT>
+    <!-- 开启单文件发布 -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- 核心：将原生库也打包进单文件中（运行时会自动解压到临时目录） -->
+    <IncludeNativeLibrariesForExtract>true</IncludeNativeLibrariesForExtract>
+    <!-- 可选：压缩单文件体积 -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
   <ItemGroup>

@@ -47,6 +47,7 @@ internal unsafe class Program
 
   static ColorMode colorMode { get; set; } = ColorMode.Grayscale;
   static bool ViewOutputDir { get; set; } = false;
+  static int Scale { get; set; } = 1;
 
   static void ParseOptions(ReadOnlySpan<char> expression)
   {
@@ -65,6 +66,33 @@ internal unsafe class Program
         case 'i':
           colorMode = ColorMode.InfraredThermogram;
           break;
+        case 's':
+          {
+            var j = i + 1;
+            while (j < expression.Length && char.IsDigit(expression[j]))
+            {
+              j++;
+            }
+
+            if (j == i + 1)
+            {
+              Console.WriteLine("WARN! Missing scale value after 's'.");
+              break;
+            }
+
+            if (!int.TryParse(expression[(i + 1)..j], out var parsedScale) || parsedScale <= 0)
+            {
+              Console.WriteLine($"WARN! Invalid scale value: '{expression[(i + 1)..j].ToString()}', fallback to scale=1.");
+              Scale = 1;
+            }
+            else
+            {
+              Scale = parsedScale;
+            }
+
+            i = j - 1;
+          }
+          break;
         default:
           Console.WriteLine($"WARN! Unknown option: '{expression[i]}'");
           break;
@@ -75,11 +103,12 @@ internal unsafe class Program
   static void PrintUsage()
   {
     var exeName = Path.GetFileNameWithoutExtension(Environment.GetCommandLineArgs()[0]);
-    Console.WriteLine($"Usage: {exeName} [-v|g|i] <file1> <file2> ...");
+    Console.WriteLine($"Usage: {exeName} [-v|g|i|sN] <file1> <file2> ...");
     Console.WriteLine("Options:");
     Console.WriteLine("  v, Open the output directory after processing");
     Console.WriteLine("  g, Use grayscale color mode (default)");
     Console.WriteLine("  i, Use infrared thermogram color mode");
+    Console.WriteLine("  sN, Scale each logical pixel to N x N block (e.g. -s2, -vis2)");
   }
 
   private static void Main(string[] args)
@@ -192,8 +221,17 @@ internal unsafe class Program
           {
             var ptr = pMap + y * 256 + x;
             var intensity = (byte)(NLog(*ptr) / nMax * 255);
-            var offset = y * stride + x * bytesPerPixel;
-            writter(pBitmap, offset, intensity);
+            var baseY = y * Scale;
+            var baseX = x * Scale;
+            for (int sy = 0; sy < Scale; sy++)
+            {
+              var rowOffset = (baseY + sy) * stride + baseX * bytesPerPixel;
+              for (int sx = 0; sx < Scale; sx++)
+              {
+                var offset = rowOffset + sx * bytesPerPixel;
+                writter(pBitmap, offset, intensity);
+              }
+            }
           }
         }
       }
@@ -215,14 +253,15 @@ internal unsafe class Program
 
   static SKBitmap CreateBitmap(out WritePixel writter)
   {
+    var size = checked(256 * Scale);
     switch (colorMode)
     {
       case ColorMode.Grayscale:
         writter = WritePixelGray;
-        return new SKBitmap(new SKImageInfo(256, 256, SKColorType.Gray8));
+        return new SKBitmap(new SKImageInfo(size, size, SKColorType.Gray8));
       case ColorMode.InfraredThermogram:
         writter = WritePixelInfrared;
-        return new SKBitmap(new SKImageInfo(256, 256, SKColorType.Rgb888x));
+        return new SKBitmap(new SKImageInfo(size, size, SKColorType.Rgb888x));
       default:
         throw new InvalidOperationException("Unsupported color mode: " + colorMode);
     }
