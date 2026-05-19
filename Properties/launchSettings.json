@@ -3,6 +3,10 @@
     "fdia2": {
       "commandName": "Project",
       "commandLineArgs": "-uis2 D:/CloudMusic/*.wav"
+    },
+    "fdia3": {
+      "commandName": "Project",
+      "commandLineArgs": "-3ug D:/test/pictures/*.jpg"
     }
   }
 }

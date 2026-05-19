@@ -6,6 +6,7 @@ namespace Fdia2.Cli;
 internal class Program
 {
   static bool ViewOutputDir { get; set; } = false;
+  static bool Run3DMode { get; set; } = false;
 
   private static void Main(string[] args)
   {
@@ -57,6 +58,9 @@ internal class Program
         case 's':
           i = ParseScaleOption(expression, i);
           break;
+        case '3':
+          Run3DMode = true;
+          break;
         case 'u':
           break;
         default:
@@ -92,9 +96,10 @@ internal class Program
   static void PrintUsage()
   {
     var exeName = Path.GetFileNameWithoutExtension(Environment.GetCommandLineArgs()[0]);
-    Console.WriteLine($"Usage: {exeName} [-u] [-v|g|i] [-sN] <file1> <file2> ...");
+    Console.WriteLine($"Usage: {exeName} [-u] [-3] [-v|g|i] [-sN] <file1> <file2> ...");
     Console.WriteLine("Options:");
     Console.WriteLine("  u, Run in GUI mode (default when no arguments)");
+    Console.WriteLine("  3, Run fdia3 mode (3-byte voxel analysis + point cloud)");
     Console.WriteLine("  v, Open the output directory after processing");
     Console.WriteLine("  g, Use grayscale color mode (default)");
     Console.WriteLine("  i, Use infrared thermogram color mode");
@@ -102,6 +107,8 @@ internal class Program
     Console.WriteLine();
     Console.WriteLine("GUI quick keys:");
     Console.WriteLine("  G/I switch color mode, F5 process queued files, O open output, Esc quit");
+    Console.WriteLine("fdia3 GUI keys:");
+    Console.WriteLine("  Mouse LeftDrag/Wheel rotate/zoom, Left/Right switch preview, R reset camera");
   }
 
   static bool ShouldRunGui(string[] args)
@@ -132,7 +139,9 @@ internal class Program
       return;
     }
 
-    var outputFiles = HeatmapProcessor.ProcessFiles(fileArgs, outputDir);
+    var outputFiles = Run3DMode
+      ? VolumeProcessor.ProcessFiles(fileArgs, outputDir)
+      : HeatmapProcessor.ProcessFiles(fileArgs, outputDir);
     Console.WriteLine($"{outputFiles.Count} file(s) processed.");
 
     if (ViewOutputDir)
@@ -145,7 +154,14 @@ internal class Program
     Directory.CreateDirectory(outputDir);
     var initialFiles = HeatmapProcessor.ExpandWildcardArgs(args).ToList();
 
-    using var guiWindow = new HeatmapGuiWindow(outputDir, initialFiles, ViewOutputDir);
-    guiWindow.Run();
+    if (Run3DMode)
+    {
+      using var fdia3Window = new Fdia3GuiWindow(outputDir, initialFiles, ViewOutputDir);
+      fdia3Window.Run();
+      return;
+    }
+
+    using var fdia2Window = new HeatmapGuiWindow(outputDir, initialFiles, ViewOutputDir);
+    fdia2Window.Run();
   }
 }
