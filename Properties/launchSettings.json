@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "fdia2": {
+      "commandName": "Project",
+      "commandLineArgs": "-vis2 D:/test/pictures/*.jpg"
+    }
+  }
+}

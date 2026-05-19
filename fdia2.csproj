@@ -17,7 +17,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="OpenTK" Version="4.9.4" />
     <PackageReference Include="SkiaSharp" Version="4.147.0-preview.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <TrimmerRootAssembly Include="OpenTK.Windowing.Desktop" />
   </ItemGroup>
 
 </Project>
