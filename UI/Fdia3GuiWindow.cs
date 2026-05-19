@@ -5,6 +5,7 @@ using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 using SkiaSharp;
+using System.Reflection;
 
 namespace Fdia2.UI;
 
@@ -15,6 +16,14 @@ public sealed class Fdia3GuiWindow : GameWindow
     PointCloud,
     VolumeComposite,
     VolumeMip,
+  }
+
+  enum HudSliderTarget
+  {
+    None,
+    Density,
+    Opacity,
+    Slice,
   }
 
   readonly string outputDir;
@@ -55,12 +64,16 @@ public sealed class Fdia3GuiWindow : GameWindow
   string hudText = string.Empty;
   bool hudTextDirty = true;
 
-  RenderMode renderMode = RenderMode.PointCloud;
+  RenderMode renderMode = RenderMode.VolumeMip;
   bool clippingEnabled = false;
   float clipOffset = 0f;
   float densityGain = DensityGainMax;
   float opacityGain = OpacityGainMax;
   string status = "Ready";
+  HudSliderTarget activeHudSlider = HudSliderTarget.None;
+  Vector4 densitySliderRectPx;
+  Vector4 opacitySliderRectPx;
+  Vector4 sliceSliderRectPx;
 
   bool isRotating;
   Vector2 lastMousePosition;
@@ -83,6 +96,11 @@ public sealed class Fdia3GuiWindow : GameWindow
   const float HudPaddingPx = 10f;
   const float HudCornerRadiusPx = 8f;
   const int HudMarginPx = 12;
+  const float HudSliderTrackHeightPx = 6f;
+  const float HudSliderHitHeightPx = 20f;
+  const float HudSliderSectionGapPx = 8f;
+  const float HudSliderSectionLabelGapPx = 4f;
+  const float HudSliderThumbRadiusPx = 7f;
   static readonly Vector3 ReferenceOrigin = new(-0.5f, -0.5f, -0.5f);
   const float ReferenceAxisLengthMin = 4f;
   const float ReferenceAxisLengthFactor = 6f;
@@ -245,6 +263,9 @@ public sealed class Fdia3GuiWindow : GameWindow
     if (e.Button != MouseButton.Left)
       return;
 
+    if (TryBeginHudSliderDrag(MousePosition))
+      return;
+
     isRotating = true;
     lastMousePosition = MousePosition;
   }
@@ -252,6 +273,15 @@ public sealed class Fdia3GuiWindow : GameWindow
   protected override void OnMouseUp(MouseButtonEventArgs e)
   {
     base.OnMouseUp(e);
+    if (e.Button != MouseButton.Left)
+      return;
+
+    if (activeHudSlider != HudSliderTarget.None)
+    {
+      activeHudSlider = HudSliderTarget.None;
+      return;
+    }
+
     if (e.Button == MouseButton.Left)
       isRotating = false;
   }
@@ -259,6 +289,12 @@ public sealed class Fdia3GuiWindow : GameWindow
   protected override void OnMouseMove(MouseMoveEventArgs e)
   {
     base.OnMouseMove(e);
+    if (activeHudSlider != HudSliderTarget.None)
+    {
+      UpdateHudSliderValueFromMouse(e.Position.X);
+      return;
+    }
+
     if (!isRotating)
       return;
 
@@ -282,6 +318,8 @@ public sealed class Fdia3GuiWindow : GameWindow
   void SetRenderMode(RenderMode mode)
   {
     renderMode = mode;
+    activeHudSlider = HudSliderTarget.None;
+
     status = mode switch
     {
       RenderMode.PointCloud => "Switched to point cloud",
@@ -290,6 +328,73 @@ public sealed class Fdia3GuiWindow : GameWindow
       _ => status,
     };
   }
+
+  bool TryBeginHudSliderDrag(Vector2 mousePosition)
+  {
+    if (renderMode != RenderMode.VolumeComposite && renderMode != RenderMode.VolumeMip)
+      return false;
+
+    if (renderMode == RenderMode.VolumeComposite && ContainsRect(densitySliderRectPx, mousePosition))
+    {
+      activeHudSlider = HudSliderTarget.Density;
+      isRotating = false;
+      UpdateHudSliderValueFromMouse(mousePosition.X);
+      return true;
+    }
+
+    if (renderMode == RenderMode.VolumeComposite && ContainsRect(opacitySliderRectPx, mousePosition))
+    {
+      activeHudSlider = HudSliderTarget.Opacity;
+      isRotating = false;
+      UpdateHudSliderValueFromMouse(mousePosition.X);
+      return true;
+    }
+
+    if (renderMode == RenderMode.VolumeMip && ContainsRect(sliceSliderRectPx, mousePosition))
+    {
+      activeHudSlider = HudSliderTarget.Slice;
+      isRotating = false;
+      UpdateHudSliderValueFromMouse(mousePosition.X);
+      return true;
+    }
+
+    return false;
+  }
+
+  void UpdateHudSliderValueFromMouse(float mouseX)
+  {
+    var (rect, min, max, label) = activeHudSlider switch
+    {
+      HudSliderTarget.Density => (densitySliderRectPx, DensityGainMin, DensityGainMax, "Density"),
+      HudSliderTarget.Opacity => (opacitySliderRectPx, OpacityGainMin, OpacityGainMax, "Opacity"),
+      HudSliderTarget.Slice => (sliceSliderRectPx, ClipOffsetMin, ClipOffsetMax, "Slice"),
+      _ => (Vector4.Zero, 0f, 0f, string.Empty),
+    };
+
+    if (activeHudSlider == HudSliderTarget.None || rect.Z <= rect.X)
+      return;
+
+    var t = Math.Clamp((mouseX - rect.X) / (rect.Z - rect.X), 0f, 1f);
+    var value = min + t * (max - min);
+    switch (activeHudSlider)
+    {
+      case HudSliderTarget.Density:
+        densityGain = value;
+        break;
+      case HudSliderTarget.Opacity:
+        opacityGain = value;
+        break;
+      case HudSliderTarget.Slice:
+        clipOffset = value;
+        break;
+    }
+
+    status = $"{label} slider: {value:F2}";
+    UpdateWindowTitle();
+  }
+
+  static bool ContainsRect(Vector4 rect, Vector2 point) =>
+    point.X >= rect.X && point.X <= rect.Z && point.Y >= rect.Y && point.Y <= rect.W;
 
   void StartProcessingPendingFiles()
   {
@@ -430,19 +535,25 @@ public sealed class Fdia3GuiWindow : GameWindow
       ? $"{previewIndex + 1}/{previewFiles.Count}"
       : "None";
     var clipState = clippingEnabled ? $"On@{clipOffset:F2}" : "Off";
-    return string.Join(
-      Environment.NewLine,
-      [
-        $"Mode: {renderMode}",
-        $"Dens: {densityGain:F2} | Opac: {opacityGain:F2}",
-        $"Clip: {clipState}",
-        $"Pending: {pendingFiles.Count} | Preview: {previewStatus}",
-        $"Points: {pointCount:N0} | Busy: {isBusy}",
-        $"Origin(0,0,0): ({ReferenceOrigin.X:F1},{ReferenceOrigin.Y:F1},{ReferenceOrigin.Z:F1})",
-        $"Status: {status}",
-        "Keys: F1/F2/F3 Mode | C Clip | [ ] ClipOffset",
-        "      , . Density | - = Opacity | <- -> Preview | R Reset",
-      ]);
+    var lines = new List<string>
+    {
+      $"Mode: {renderMode}",
+      $"Dens: {densityGain:F2} | Opac: {opacityGain:F2}",
+      $"Clip: {clipState}",
+      $"Pending: {pendingFiles.Count} | Preview: {previewStatus}",
+      $"Points: {pointCount:N0} | Busy: {isBusy}",
+      $"Origin(0,0,0): ({ReferenceOrigin.X:F1},{ReferenceOrigin.Y:F1},{ReferenceOrigin.Z:F1})",
+      $"Status: {status}",
+      "Keys: F1/F2/F3 Mode | C Clip | [ ] ClipOffset",
+      "      , . Density | - = Opacity | <- -> Preview | R Reset",
+    };
+
+    if (renderMode == RenderMode.VolumeComposite)
+      lines.Add("Composite sliders: drag Density/Opacity bars below");
+    else if (renderMode == RenderMode.VolumeMip)
+      lines.Add("MIP slider: drag Slice bar below");
+
+    return string.Join(Environment.NewLine, lines);
   }
 
   void ResetCamera()
@@ -639,48 +750,7 @@ public sealed class Fdia3GuiWindow : GameWindow
 
   int CreatePointCloudShaderProgram()
   {
-    const string vertexShaderSource = """
-      #version 330 core
-      layout (location = 0) in vec3 aPosition;
-      layout (location = 1) in float aIntensity;
-      out float vIntensity;
-      uniform mat4 uView;
-      uniform mat4 uProjection;
-      void main()
-      {
-          gl_Position = uProjection * uView * vec4(aPosition, 1.0);
-          gl_PointSize = 2.0 + aIntensity * 4.0;
-          vIntensity = aIntensity;
-      }
-      """;
-
-    const string fragmentShaderSource = """
-      #version 330 core
-      in float vIntensity;
-      out vec4 fragColor;
-
-      vec3 ColorRamp(float t)
-      {
-          t = clamp(t, 0.0, 1.0);
-          vec3 a = vec3(0.05, 0.12, 0.45);
-          vec3 b = vec3(0.00, 0.90, 1.00);
-          vec3 c = vec3(1.00, 0.95, 0.20);
-          vec3 d = vec3(1.00, 0.25, 0.00);
-          if (t < 0.33)
-              return mix(a, b, t / 0.33);
-          if (t < 0.66)
-              return mix(b, c, (t - 0.33) / 0.33);
-          return mix(c, d, (t - 0.66) / 0.34);
-      }
-
-      void main()
-      {
-          vec3 color = ColorRamp(vIntensity);
-          fragColor = vec4(color, 1.0);
-      }
-      """;
-
-    return CreateShaderProgram(vertexShaderSource, fragmentShaderSource, "point cloud");
+    return CreateShaderProgramFromResources("point_cloud.vert", "point_cloud.frag", "point cloud");
   }
 
   void InitializeReferenceRenderer()
@@ -716,86 +786,12 @@ public sealed class Fdia3GuiWindow : GameWindow
 
   int CreateReferenceShaderProgram()
   {
-    const string vertexShaderSource = """
-      #version 330 core
-      layout (location = 0) in vec3 aPosition;
-      layout (location = 1) in vec3 aColor;
-      out vec3 vColor;
-      uniform mat4 uView;
-      uniform mat4 uProjection;
-      void main()
-      {
-          gl_Position = uProjection * uView * vec4(aPosition, 1.0);
-          vColor = aColor;
-      }
-      """;
-
-    const string fragmentShaderSource = """
-      #version 330 core
-      in vec3 vColor;
-      out vec4 fragColor;
-      void main()
-      {
-          fragColor = vec4(vColor, 1.0);
-      }
-      """;
-
-    return CreateShaderProgram(vertexShaderSource, fragmentShaderSource, "reference");
+    return CreateShaderProgramFromResources("reference.vert", "reference.frag", "reference");
   }
 
   int CreateReferenceGridShaderProgram()
   {
-    const string vertexShaderSource = """
-      #version 330 core
-      layout (location = 0) in vec3 aWorldPos;
-      out vec3 vWorldPos;
-      uniform mat4 uView;
-      uniform mat4 uProjection;
-      void main()
-      {
-          vWorldPos = aWorldPos;
-          gl_Position = uProjection * uView * vec4(aWorldPos, 1.0);
-      }
-      """;
-
-    const string fragmentShaderSource = """
-      #version 330 core
-      in vec3 vWorldPos;
-      out vec4 fragColor;
-      uniform vec3 uReferenceOrigin;
-      uniform vec3 uCameraPosition;
-      uniform float uMinorCell;
-      uniform float uMajorCell;
-      uniform float uFadeDistance;
-      uniform vec3 uMinorColor;
-      uniform vec3 uMajorColor;
-
-      float GridFactor(vec2 pos, float cellSize)
-      {
-          vec2 coord = pos / cellSize;
-          vec2 deriv = max(fwidth(coord), vec2(1e-4));
-          vec2 lineDist = abs(fract(coord - 0.5) - 0.5) / deriv;
-          float line = min(lineDist.x, lineDist.y);
-          return 1.0 - clamp(line, 0.0, 1.0);
-      }
-
-      void main()
-      {
-          vec2 local = vWorldPos.xz - uReferenceOrigin.xz;
-          float minor = GridFactor(local, uMinorCell);
-          float major = GridFactor(local, uMajorCell);
-          float dist = length(vWorldPos - uCameraPosition);
-          float fade = clamp(1.0 - dist / max(uFadeDistance, 1e-4), 0.0, 1.0);
-          float alpha = max(minor * 0.28, major * 0.85) * fade;
-          if (alpha < 0.01)
-              discard;
-
-          vec3 color = mix(uMinorColor, uMajorColor, clamp(major, 0.0, 1.0));
-          fragColor = vec4(color, alpha);
-      }
-      """;
-
-    return CreateShaderProgram(vertexShaderSource, fragmentShaderSource, "reference grid");
+    return CreateShaderProgramFromResources("reference_grid.vert", "reference_grid.frag", "reference grid");
   }
 
   void UpdateReferenceGeometry(Vector3 eye)
@@ -879,130 +875,32 @@ public sealed class Fdia3GuiWindow : GameWindow
 
   int CreateVolumeShaderProgram()
   {
-    const string vertexShaderSource = """
-      #version 330 core
-      layout (location = 0) in vec2 aPosition;
-      layout (location = 1) in vec2 aTexCoord;
-      out vec2 vTexCoord;
-      void main()
-      {
-          gl_Position = vec4(aPosition, 0.0, 1.0);
-          vTexCoord = aTexCoord;
-      }
-      """;
+    return CreateShaderProgramFromResources("volume.vert", "volume.frag", "volume");
+  }
 
-    const string fragmentShaderSource = """
-      #version 330 core
-      in vec2 vTexCoord;
-      out vec4 fragColor;
+  static int CreateShaderProgramFromResources(string vertexShaderFileName, string fragmentShaderFileName, string label)
+  {
+    var vertexShaderSource = LoadShaderSourceFromResource(vertexShaderFileName);
+    var fragmentShaderSource = LoadShaderSourceFromResource(fragmentShaderFileName);
+    return CreateShaderProgram(vertexShaderSource, fragmentShaderSource, label);
+  }
 
-      uniform sampler3D uVolumeTex;
-      uniform sampler1D uTransferTex;
-      uniform vec3 uCameraPosition;
-      uniform vec3 uCameraForward;
-      uniform vec3 uCameraRight;
-      uniform vec3 uCameraUp;
-      uniform float uAspect;
-      uniform float uTanHalfFov;
-      uniform float uStepSize;
-      uniform float uDensityGain;
-      uniform float uVolumeValueScale;
-      uniform float uOpacityGain;
-      uniform float uEarlyTerminateAlpha;
-      uniform int uRenderMode; // 0: composite, 1: mip
-      uniform int uClipEnabled;
-      uniform vec3 uClipNormal;
-      uniform float uClipOffset;
+  static string LoadShaderSourceFromResource(string shaderFileName)
+  {
+    var assembly = Assembly.GetExecutingAssembly();
+    var normalizedName = shaderFileName.Replace('\\', '.').Replace('/', '.');
+    var suffix = ".Shaders." + normalizedName;
+    var resourceName = assembly
+      .GetManifestResourceNames()
+      .FirstOrDefault(name => name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
 
-      const vec3 kBoxMin = vec3(-0.5);
-      const vec3 kBoxMax = vec3(0.5);
+    if (resourceName == null)
+      throw new InvalidOperationException($"Shader resource not found for '{shaderFileName}'. Expected suffix '{suffix}'.");
 
-      bool RayBoxIntersect(vec3 rayOrigin, vec3 rayDir, out float tEnter, out float tExit)
-      {
-          vec3 invDir = 1.0 / rayDir;
-          vec3 t0 = (kBoxMin - rayOrigin) * invDir;
-          vec3 t1 = (kBoxMax - rayOrigin) * invDir;
-          vec3 tMin = min(t0, t1);
-          vec3 tMax = max(t0, t1);
-          tEnter = max(max(tMin.x, tMin.y), tMin.z);
-          tExit = min(min(tMax.x, tMax.y), tMax.z);
-          return tExit >= max(tEnter, 0.0);
-      }
-
-      bool IsClipped(vec3 worldPos)
-      {
-          if (uClipEnabled == 0)
-              return false;
-          float d = dot(worldPos, normalize(uClipNormal));
-          return d > uClipOffset;
-      }
-
-      void main()
-      {
-          vec2 ndc = vTexCoord * 2.0 - 1.0;
-          vec3 rayDir = normalize(
-              uCameraForward
-              + ndc.x * uCameraRight * uTanHalfFov * uAspect
-              + ndc.y * uCameraUp * uTanHalfFov);
-
-          float tEnter;
-          float tExit;
-          if (!RayBoxIntersect(uCameraPosition, rayDir, tEnter, tExit))
-          {
-              fragColor = vec4(0.0);
-              return;
-          }
-
-          tEnter = max(tEnter, 0.0);
-          vec4 accum = vec4(0.0);
-          float maxDensity = 0.0;
-          float t = tEnter;
-          while (t <= tExit)
-          {
-              vec3 worldPos = uCameraPosition + rayDir * t;
-              if (!IsClipped(worldPos))
-              {
-                  vec3 texCoord = worldPos + vec3(0.5);
-                  float density = texture(uVolumeTex, texCoord).r;
-                  density = clamp(density * uVolumeValueScale, 0.0, 1.0);
-                  density = clamp(pow(density, 0.62) * uDensityGain, 0.0, 1.0);
-
-                  if (uRenderMode == 1)
-                  {
-                      maxDensity = max(maxDensity, density);
-                  }
-                  else
-                  {
-                      vec4 sampleColor = texture(uTransferTex, density);
-                      sampleColor.a = clamp(sampleColor.a * uOpacityGain, 0.0, 1.0);
-                      accum.rgb += (1.0 - accum.a) * sampleColor.rgb * sampleColor.a;
-                      accum.a += (1.0 - accum.a) * sampleColor.a;
-                      if (accum.a >= uEarlyTerminateAlpha)
-                          break;
-                  }
-              }
-
-              t += uStepSize;
-          }
-
-          if (uRenderMode == 1)
-          {
-              if (maxDensity <= 0.0)
-              {
-                  fragColor = vec4(0.0);
-                  return;
-              }
-
-              vec4 mipColor = texture(uTransferTex, maxDensity);
-              fragColor = vec4(mipColor.rgb, 0.92);
-              return;
-          }
-
-          fragColor = accum;
-      }
-      """;
-
-    return CreateShaderProgram(vertexShaderSource, fragmentShaderSource, "volume");
+    using var stream = assembly.GetManifestResourceStream(resourceName)
+      ?? throw new InvalidOperationException($"Failed to open shader resource stream '{resourceName}'.");
+    using var reader = new StreamReader(stream);
+    return reader.ReadToEnd();
   }
 
   static int CreateShaderProgram(string vertexShaderSource, string fragmentShaderSource, string label)
@@ -1121,30 +1019,7 @@ public sealed class Fdia3GuiWindow : GameWindow
 
   int CreateHudShaderProgram()
   {
-    const string vertexShaderSource = """
-      #version 330 core
-      layout (location = 0) in vec2 aPosition;
-      layout (location = 1) in vec2 aTexCoord;
-      out vec2 vTexCoord;
-      void main()
-      {
-          gl_Position = vec4(aPosition, 0.0, 1.0);
-          vTexCoord = aTexCoord;
-      }
-      """;
-
-    const string fragmentShaderSource = """
-      #version 330 core
-      in vec2 vTexCoord;
-      out vec4 fragColor;
-      uniform sampler2D uHudTexture;
-      void main()
-      {
-          fragColor = texture(uHudTexture, vTexCoord);
-      }
-      """;
-
-    return CreateShaderProgram(vertexShaderSource, fragmentShaderSource, "hud");
+    return CreateShaderProgramFromResources("hud.vert", "hud.frag", "hud");
   }
 
   void UpdateHudTextureIfNeeded()
@@ -1153,6 +1028,9 @@ public sealed class Fdia3GuiWindow : GameWindow
       return;
 
     hudTextDirty = false;
+    densitySliderRectPx = Vector4.Zero;
+    opacitySliderRectPx = Vector4.Zero;
+    sliceSliderRectPx = Vector4.Zero;
     if (string.IsNullOrWhiteSpace(hudText))
     {
       hudTextureWidth = 0;
@@ -1180,8 +1058,18 @@ public sealed class Fdia3GuiWindow : GameWindow
     foreach (var line in lines)
       maxLineWidth = Math.Max(maxLineWidth, font.MeasureText(line));
 
-    var width = Math.Max(1, (int)MathF.Ceiling(maxLineWidth + HudPaddingPx * 2f));
-    var height = Math.Max(1, (int)MathF.Ceiling(lines.Length * lineHeight + HudPaddingPx * 2f));
+    var showCompositeSliders = renderMode == RenderMode.VolumeComposite;
+    var showMipSliceSlider = renderMode == RenderMode.VolumeMip;
+    var sliderCount = showCompositeSliders ? 2 : showMipSliceSlider ? 1 : 0;
+    var sliderTrackWidth = Math.Max(190f, maxLineWidth);
+    var sliderLabelHeight = MathF.Ceiling(metrics.Descent - metrics.Ascent);
+    var sliderRowHeight = sliderLabelHeight + HudSliderSectionLabelGapPx + HudSliderHitHeightPx;
+    var sliderSectionHeight = sliderCount > 0
+      ? HudSliderSectionGapPx + sliderCount * sliderRowHeight + Math.Max(0, sliderCount - 1) * HudSliderSectionGapPx
+      : 0f;
+
+    var width = Math.Max(1, (int)MathF.Ceiling(Math.Max(maxLineWidth, sliderTrackWidth) + HudPaddingPx * 2f));
+    var height = Math.Max(1, (int)MathF.Ceiling(lines.Length * lineHeight + HudPaddingPx * 2f + sliderSectionHeight));
     using var bitmap = new SKBitmap(new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Premul));
     using (var canvas = new SKCanvas(bitmap))
     {
@@ -1197,6 +1085,62 @@ public sealed class Fdia3GuiWindow : GameWindow
       for (int i = 0; i < lines.Length; i++)
       {
         canvas.DrawText(lines[i], HudPaddingPx, baseline + i * lineHeight, SKTextAlign.Left, font, textPaint);
+      }
+
+      if (sliderCount > 0)
+      {
+        using var trackPaint = new SKPaint
+        {
+          IsAntialias = true,
+          Color = new SKColor(255, 255, 255, 70),
+        };
+        using var fillPaint = new SKPaint
+        {
+          IsAntialias = true,
+          Color = new SKColor(85, 190, 255, 220),
+        };
+        using var thumbPaint = new SKPaint
+        {
+          IsAntialias = true,
+          Color = new SKColor(240, 248, 255, 240),
+        };
+
+        var sliderLeft = HudPaddingPx;
+        var sliderTop = HudPaddingPx + lines.Length * lineHeight + HudSliderSectionGapPx;
+        var sliderWidth = width - HudPaddingPx * 2f;
+        var nextSliderTop = sliderTop;
+        if (showCompositeSliders)
+        {
+          var densityRect = DrawHudSlider(canvas, font, textPaint, trackPaint, fillPaint, thumbPaint,
+                                          "Density", densityGain, DensityGainMin, DensityGainMax,
+                                          sliderLeft, nextSliderTop, sliderWidth, sliderLabelHeight);
+          nextSliderTop += sliderRowHeight + HudSliderSectionGapPx;
+          var opacityRect = DrawHudSlider(canvas, font, textPaint, trackPaint, fillPaint, thumbPaint,
+                                          "Opacity", opacityGain, OpacityGainMin, OpacityGainMax,
+                                          sliderLeft, nextSliderTop, sliderWidth, sliderLabelHeight);
+
+          densitySliderRectPx = new Vector4(
+            HudMarginPx + densityRect.Left,
+            HudMarginPx + densityRect.Top,
+            HudMarginPx + densityRect.Right,
+            HudMarginPx + densityRect.Bottom);
+          opacitySliderRectPx = new Vector4(
+            HudMarginPx + opacityRect.Left,
+            HudMarginPx + opacityRect.Top,
+            HudMarginPx + opacityRect.Right,
+            HudMarginPx + opacityRect.Bottom);
+        }
+        else if (showMipSliceSlider)
+        {
+          var sliceRect = DrawHudSlider(canvas, font, textPaint, trackPaint, fillPaint, thumbPaint,
+                                        "Slice", clipOffset, ClipOffsetMin, ClipOffsetMax,
+                                        sliderLeft, nextSliderTop, sliderWidth, sliderLabelHeight);
+          sliceSliderRectPx = new Vector4(
+            HudMarginPx + sliceRect.Left,
+            HudMarginPx + sliceRect.Top,
+            HudMarginPx + sliceRect.Right,
+            HudMarginPx + sliceRect.Bottom);
+        }
       }
     }
 
@@ -1217,6 +1161,40 @@ public sealed class Fdia3GuiWindow : GameWindow
 
     hudTextureWidth = width;
     hudTextureHeight = height;
+  }
+
+  static SKRect DrawHudSlider(SKCanvas canvas,
+                              SKFont font,
+                              SKPaint textPaint,
+                              SKPaint trackPaint,
+                              SKPaint fillPaint,
+                              SKPaint thumbPaint,
+                               string label,
+                               float value,
+                               float min,
+                               float max,
+                               float left,
+                               float top,
+                               float width,
+                               float labelHeight)
+  {
+    var normalized = max <= min ? 0f : Math.Clamp((value - min) / (max - min), 0f, 1f);
+    var labelBaseline = top - font.Metrics.Ascent;
+    canvas.DrawText($"{label}: {value:F2}", left, labelBaseline, SKTextAlign.Left, font, textPaint);
+
+    var hitTop = top + labelHeight + HudSliderSectionLabelGapPx;
+    var trackTop = hitTop + (HudSliderHitHeightPx - HudSliderTrackHeightPx) * 0.5f;
+    var trackRect = new SKRect(left, trackTop, left + width, trackTop + HudSliderTrackHeightPx);
+    canvas.DrawRoundRect(trackRect, HudSliderTrackHeightPx * 0.5f, HudSliderTrackHeightPx * 0.5f, trackPaint);
+
+    var fillRect = new SKRect(trackRect.Left, trackRect.Top, trackRect.Left + trackRect.Width * normalized, trackRect.Bottom);
+    canvas.DrawRoundRect(fillRect, HudSliderTrackHeightPx * 0.5f, HudSliderTrackHeightPx * 0.5f, fillPaint);
+
+    var thumbX = trackRect.Left + trackRect.Width * normalized;
+    var thumbY = (trackRect.Top + trackRect.Bottom) * 0.5f;
+    canvas.DrawCircle(thumbX, thumbY, HudSliderThumbRadiusPx, thumbPaint);
+
+    return new SKRect(left, hitTop, left + width, hitTop + HudSliderHitHeightPx);
   }
 
   void GetCameraPose(out Vector3 eye, out Vector3 forward, out Vector3 right, out Vector3 up)
@@ -1525,6 +1503,8 @@ public sealed class Fdia3GuiWindow : GameWindow
     Console.WriteLine("Logic origin (0,0,0) is anchored at world coordinate (-0.5,-0.5,-0.5).");
     Console.WriteLine("Render modes: F1=PointCloud, F2=Volume Composite, F3=Volume MIP");
     Console.WriteLine("Volume controls: C=Clip On/Off, [ / ]=Clip Offset, , / .=Density Gain, - / ==Opacity Gain");
+    Console.WriteLine("Composite mode: drag Density/Opacity sliders in the HUD (top-left).");
+    Console.WriteLine("MIP mode: drag Slice slider in the HUD (top-left).");
     Console.WriteLine("Mouse: Left Drag=Rotate, Wheel=Zoom");
     Console.WriteLine("Keys: Left/A=Previous preview, Right/D=Next preview, R=Reset camera, O=Open output folder, H=Help, Esc=Quit");
   }
