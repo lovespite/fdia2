@@ -99,7 +99,7 @@ internal class Program
     Console.WriteLine($"Usage: {exeName} [-u] [-3] [-v|g|i] [-sN] <file1> <file2> ...");
     Console.WriteLine("Options:");
     Console.WriteLine("  u, Run in GUI mode (default when no arguments)");
-    Console.WriteLine("  3, Run fdia3 mode (3-byte voxel analysis + point cloud)");
+    Console.WriteLine("  3, Run fdia3 mode (3-byte voxel analysis + point cloud, output *.fd3)");
     Console.WriteLine("  v, Open the output directory after processing");
     Console.WriteLine("  g, Use grayscale color mode (default)");
     Console.WriteLine("  i, Use infrared thermogram color mode");
@@ -109,6 +109,7 @@ internal class Program
     Console.WriteLine("  G/I switch color mode, F5 process queued files, O open output, Esc quit");
     Console.WriteLine("fdia3 GUI keys:");
     Console.WriteLine("  Mouse LeftDrag/Wheel rotate/zoom, Left/Right switch preview, R reset camera");
+    Console.WriteLine("  Tip: dropping valid .fd3 files loads them directly for rendering");
   }
 
   static bool ShouldRunGui(string[] args)

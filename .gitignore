@@ -5,3 +5,5 @@ output/
 *.log
 *.tmp
 .vs
+*.bin
+*.fd3

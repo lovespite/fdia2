@@ -9,6 +9,7 @@ public static class VolumeProcessor
 {
   public const int AxisLength = 256;
   public const int VoxelCount = AxisLength * AxisLength * AxisLength;
+  public const string Fd3Extension = ".fd3";
   const int BytesPerVoxel = sizeof(ushort);
   const int GroupSize = 3;
   const string RawEntryName = "volume.raw";
@@ -64,7 +65,7 @@ public static class VolumeProcessor
     var volume = new ushort[VoxelCount];
     FillVolume(stream, volume, buffer);
 
-    var outputFilePath = Path.Combine(outputDir, Path.GetFileName(filePath) + ".volume.zip");
+    var outputFilePath = Path.Combine(outputDir, Path.GetFileName(filePath) + Fd3Extension);
     SaveVolumeZip(volume, filePath, outputFilePath);
     return outputFilePath;
   }
@@ -175,6 +176,67 @@ public static class VolumeProcessor
       SourceFileName = metadata.SourceFileName,
       NonZeroVoxelCount = metadata.NonZeroVoxelCount,
     };
+  }
+
+  public static bool IsFd3FilePath(string filePath) =>
+    string.Equals(Path.GetExtension(filePath), Fd3Extension, StringComparison.OrdinalIgnoreCase);
+
+  public static bool TryValidateFd3(string filePath, out string? error)
+  {
+    error = null;
+    if (!File.Exists(filePath))
+    {
+      error = "File not found: " + filePath;
+      return false;
+    }
+
+    if (!IsFd3FilePath(filePath))
+    {
+      error = "File extension is not .fd3: " + filePath;
+      return false;
+    }
+
+    try
+    {
+      using var zip = ZipFile.OpenRead(filePath);
+      var rawEntry = zip.GetEntry(RawEntryName);
+      if (rawEntry == null)
+      {
+        error = $"Volume file is missing '{RawEntryName}'.";
+        return false;
+      }
+
+      var expectedLength = VoxelCount * BytesPerVoxel;
+      if (rawEntry.Length != expectedLength)
+      {
+        error = $"Invalid '{RawEntryName}' length. Expected {expectedLength} bytes, got {rawEntry.Length}.";
+        return false;
+      }
+
+      var metaEntry = zip.GetEntry(MetaEntryName);
+      if (metaEntry != null)
+      {
+        using var reader = new StreamReader(metaEntry.Open());
+        var json = reader.ReadToEnd();
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+          error = "Invalid metadata JSON format.";
+          return false;
+        }
+
+        if (root.TryGetProperty("dimensions", out var dimensions))
+          ValidateDimensions(dimensions);
+      }
+
+      return true;
+    }
+    catch (Exception ex)
+    {
+      error = "Invalid .fd3 file: " + ex.Message;
+      return false;
+    }
   }
 
   static byte[] SerializeVolume(ushort[] volume)

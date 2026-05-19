@@ -19,6 +19,10 @@ public sealed class Fdia3GuiWindow : GameWindow
   int pointCloudVao;
   int pointCloudVbo;
   int pointCount;
+  int referenceShaderProgram;
+  int referenceVao;
+  int referenceVbo;
+  int referenceVertexCount;
   string status = "Ready";
 
   bool isRotating;
@@ -50,6 +54,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     VSync = VSyncMode.On;
     GL.Enable(EnableCap.DepthTest);
     GL.Enable(EnableCap.ProgramPointSize);
+    InitializeReferenceRenderer();
     InitializePointCloudRenderer();
     PrintHelp();
 
@@ -88,6 +93,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     base.OnRenderFrame(args);
     GL.ClearColor(new Color4(0.05f, 0.05f, 0.08f, 1f));
     GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+    RenderReferenceGeometry();
     RenderPointCloud();
     SwapBuffers();
   }
@@ -184,9 +190,66 @@ public sealed class Fdia3GuiWindow : GameWindow
       return;
     }
 
-    var filesToProcess = pendingFiles.ToArray();
+    var filesToHandle = pendingFiles.ToArray();
     pendingFiles.Clear();
-    status = $"Processing {filesToProcess.Length} file(s)...";
+
+    var directPreviewFiles = new List<string>();
+    var filesToProcess = new List<string>();
+    var invalidFd3Count = 0;
+    foreach (var filePath in filesToHandle)
+    {
+      if (!VolumeProcessor.IsFd3FilePath(filePath))
+      {
+        filesToProcess.Add(filePath);
+        continue;
+      }
+
+      if (VolumeProcessor.TryValidateFd3(filePath, out var validationError))
+      {
+        directPreviewFiles.Add(filePath);
+      }
+      else
+      {
+        invalidFd3Count++;
+        Console.WriteLine($"FAIL! Invalid .fd3 file '{filePath}': {validationError}");
+      }
+    }
+
+    if (directPreviewFiles.Count > 0)
+    {
+      MergePreviewFiles(directPreviewFiles);
+      var latestPreview = directPreviewFiles[^1];
+      var latestPreviewIndex = previewFiles.IndexOf(latestPreview);
+      if (SelectPreview(latestPreviewIndex, out var directLoadError))
+        status = $"Loaded {directPreviewFiles.Count} .fd3 file(s) | Preview {previewIndex + 1}/{previewFiles.Count}";
+      else
+        status = $"Loaded .fd3 file(s), preview load failed: {directLoadError}";
+    }
+
+    if (filesToProcess.Count == 0)
+    {
+      if (directPreviewFiles.Count == 0)
+      {
+        status = invalidFd3Count > 0
+          ? $"No files processed. {invalidFd3Count} invalid .fd3 file(s) skipped"
+          : "No supported files queued";
+      }
+      else if (invalidFd3Count > 0)
+      {
+        status += $" | {invalidFd3Count} invalid .fd3 skipped";
+      }
+
+      Console.WriteLine(status);
+      UpdateWindowTitle();
+      return;
+    }
+
+    status = directPreviewFiles.Count > 0
+      ? $"Loaded {directPreviewFiles.Count} .fd3 file(s), processing {filesToProcess.Count} file(s)..."
+      : $"Processing {filesToProcess.Count} file(s)...";
+    if (invalidFd3Count > 0)
+      status += $" | {invalidFd3Count} invalid .fd3 skipped";
+
     Console.WriteLine(status);
     processingTask = Task.Run(() => VolumeProcessor.ProcessFiles(filesToProcess, outputDir));
     UpdateWindowTitle();
@@ -291,21 +354,21 @@ public sealed class Fdia3GuiWindow : GameWindow
     return true;
   }
 
-  bool TryCreatePointCloud(string zipFilePath, out float[] vertices, out int loadedPointCount, out string? error)
+  bool TryCreatePointCloud(string fd3FilePath, out float[] vertices, out int loadedPointCount, out string? error)
   {
     vertices = Array.Empty<float>();
     loadedPointCount = 0;
     error = null;
 
-    if (!File.Exists(zipFilePath))
+    if (!File.Exists(fd3FilePath))
     {
-      error = "Preview file not found: " + zipFilePath;
+      error = "Preview file not found: " + fd3FilePath;
       return false;
     }
 
     try
     {
-      var volumeData = VolumeProcessor.LoadVolumeZip(zipFilePath);
+      var volumeData = VolumeProcessor.LoadVolumeZip(fd3FilePath);
       loadedPointCount = checked((int)volumeData.NonZeroVoxelCount);
       if (loadedPointCount == 0)
       {
@@ -463,6 +526,149 @@ public sealed class Fdia3GuiWindow : GameWindow
     return shader;
   }
 
+  void InitializeReferenceRenderer()
+  {
+    referenceShaderProgram = CreateReferenceShaderProgram();
+    referenceVao = GL.GenVertexArray();
+    referenceVbo = GL.GenBuffer();
+
+    var vertices = BuildReferenceVertices();
+    referenceVertexCount = vertices.Length / 6;
+
+    GL.BindVertexArray(referenceVao);
+    GL.BindBuffer(BufferTarget.ArrayBuffer, referenceVbo);
+    GL.BufferData(BufferTarget.ArrayBuffer, vertices.Length * sizeof(float), vertices, BufferUsageHint.StaticDraw);
+
+    var stride = 6 * sizeof(float);
+    GL.EnableVertexAttribArray(0);
+    GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, 0);
+    GL.EnableVertexAttribArray(1);
+    GL.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, 3 * sizeof(float));
+    GL.BindVertexArray(0);
+  }
+
+  int CreateReferenceShaderProgram()
+  {
+    const string vertexShaderSource = """
+      #version 330 core
+      layout (location = 0) in vec3 aPosition;
+      layout (location = 1) in vec3 aColor;
+      out vec3 vColor;
+      uniform mat4 uView;
+      uniform mat4 uProjection;
+      void main()
+      {
+          gl_Position = uProjection * uView * vec4(aPosition, 1.0);
+          vColor = aColor;
+      }
+      """;
+
+    const string fragmentShaderSource = """
+      #version 330 core
+      in vec3 vColor;
+      out vec4 fragColor;
+      void main()
+      {
+          fragColor = vec4(vColor, 1.0);
+      }
+      """;
+
+    var vertexShader = CompileShader(ShaderType.VertexShader, vertexShaderSource);
+    var fragmentShader = CompileShader(ShaderType.FragmentShader, fragmentShaderSource);
+    var shaderProgram = GL.CreateProgram();
+
+    GL.AttachShader(shaderProgram, vertexShader);
+    GL.AttachShader(shaderProgram, fragmentShader);
+    GL.LinkProgram(shaderProgram);
+    GL.GetProgram(shaderProgram, GetProgramParameterName.LinkStatus, out var linkStatus);
+    if (linkStatus == 0)
+    {
+      var linkLog = GL.GetProgramInfoLog(shaderProgram);
+      GL.DeleteProgram(shaderProgram);
+      throw new InvalidOperationException("Failed to link reference shader program: " + linkLog);
+    }
+
+    GL.DetachShader(shaderProgram, vertexShader);
+    GL.DetachShader(shaderProgram, fragmentShader);
+    GL.DeleteShader(vertexShader);
+    GL.DeleteShader(fragmentShader);
+    return shaderProgram;
+  }
+
+  static float[] BuildReferenceVertices()
+  {
+    var vertices = new List<float>();
+    const float axisHalf = 0.65f;
+    const float gridHalf = 0.5f;
+    const float gridY = -0.5f;
+    const int gridDivisions = 20;
+
+    AddLine(vertices, new Vector3(-axisHalf, 0f, 0f), new Vector3(axisHalf, 0f, 0f), new Vector3(0.95f, 0.25f, 0.25f));
+    AddLine(vertices, new Vector3(0f, -axisHalf, 0f), new Vector3(0f, axisHalf, 0f), new Vector3(0.30f, 0.95f, 0.30f));
+    AddLine(vertices, new Vector3(0f, 0f, -axisHalf), new Vector3(0f, 0f, axisHalf), new Vector3(0.30f, 0.55f, 0.98f));
+
+    for (int i = 0; i <= gridDivisions; i++)
+    {
+      var t = i / (float)gridDivisions;
+      var coord = -gridHalf + t * (gridHalf * 2f);
+      var centerLine = Math.Abs(coord) < 1e-6f;
+      var color = centerLine ? new Vector3(0.28f, 0.28f, 0.30f) : new Vector3(0.17f, 0.17f, 0.19f);
+
+      AddLine(vertices, new Vector3(-gridHalf, gridY, coord), new Vector3(gridHalf, gridY, coord), color);
+      AddLine(vertices, new Vector3(coord, gridY, -gridHalf), new Vector3(coord, gridY, gridHalf), color);
+    }
+
+    return vertices.ToArray();
+  }
+
+  static void AddLine(List<float> vertices, Vector3 start, Vector3 end, Vector3 color)
+  {
+    vertices.Add(start.X);
+    vertices.Add(start.Y);
+    vertices.Add(start.Z);
+    vertices.Add(color.X);
+    vertices.Add(color.Y);
+    vertices.Add(color.Z);
+
+    vertices.Add(end.X);
+    vertices.Add(end.Y);
+    vertices.Add(end.Z);
+    vertices.Add(color.X);
+    vertices.Add(color.Y);
+    vertices.Add(color.Z);
+  }
+
+  void GetCameraMatrices(out Matrix4 view, out Matrix4 projection)
+  {
+    var aspect = ClientSize.X / (float)ClientSize.Y;
+    projection = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45f), aspect, 0.01f, 100f);
+    var eye = new Vector3(
+      distance * MathF.Cos(pitch) * MathF.Cos(yaw),
+      distance * MathF.Sin(pitch),
+      distance * MathF.Cos(pitch) * MathF.Sin(yaw));
+    view = Matrix4.LookAt(eye, Vector3.Zero, Vector3.UnitY);
+  }
+
+  void RenderReferenceGeometry()
+  {
+    if (referenceVertexCount <= 0 || referenceVao == 0 || referenceShaderProgram == 0)
+      return;
+
+    if (ClientSize.X <= 0 || ClientSize.Y <= 0)
+      return;
+
+    GetCameraMatrices(out var view, out var projection);
+    GL.UseProgram(referenceShaderProgram);
+    var viewLocation = GL.GetUniformLocation(referenceShaderProgram, "uView");
+    var projectionLocation = GL.GetUniformLocation(referenceShaderProgram, "uProjection");
+    GL.UniformMatrix4(viewLocation, false, ref view);
+    GL.UniformMatrix4(projectionLocation, false, ref projection);
+    GL.BindVertexArray(referenceVao);
+    GL.DrawArrays(PrimitiveType.Lines, 0, referenceVertexCount);
+    GL.BindVertexArray(0);
+    GL.UseProgram(0);
+  }
+
   void RenderPointCloud()
   {
     if (pointCount <= 0 || pointCloudVao == 0 || pointCloudShaderProgram == 0)
@@ -471,13 +677,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     if (ClientSize.X <= 0 || ClientSize.Y <= 0)
       return;
 
-    var aspect = ClientSize.X / (float)ClientSize.Y;
-    var projection = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45f), aspect, 0.01f, 100f);
-    var eye = new Vector3(
-      distance * MathF.Cos(pitch) * MathF.Cos(yaw),
-      distance * MathF.Sin(pitch),
-      distance * MathF.Cos(pitch) * MathF.Sin(yaw));
-    var view = Matrix4.LookAt(eye, Vector3.Zero, Vector3.UnitY);
+    GetCameraMatrices(out var view, out var projection);
 
     GL.UseProgram(pointCloudShaderProgram);
     var viewLocation = GL.GetUniformLocation(pointCloudShaderProgram, "uView");
@@ -492,6 +692,24 @@ public sealed class Fdia3GuiWindow : GameWindow
 
   protected override void OnUnload()
   {
+    if (referenceVbo != 0)
+    {
+      GL.DeleteBuffer(referenceVbo);
+      referenceVbo = 0;
+    }
+
+    if (referenceVao != 0)
+    {
+      GL.DeleteVertexArray(referenceVao);
+      referenceVao = 0;
+    }
+
+    if (referenceShaderProgram != 0)
+    {
+      GL.DeleteProgram(referenceShaderProgram);
+      referenceShaderProgram = 0;
+    }
+
     if (pointCloudVbo != 0)
     {
       GL.DeleteBuffer(pointCloudVbo);
@@ -516,7 +734,9 @@ public sealed class Fdia3GuiWindow : GameWindow
   static void PrintHelp()
   {
     Console.WriteLine("fdia3 GUI mode started.");
-    Console.WriteLine("Drag files to the window, then press F5 to process.");
+    Console.WriteLine("Drag files to the window, then press F5 to process/load.");
+    Console.WriteLine("Valid .fd3 files are loaded directly for rendering.");
+    Console.WriteLine("Reference geometry: XYZ axes + XZ grid plane.");
     Console.WriteLine("Mouse: Left Drag=Rotate, Wheel=Zoom");
     Console.WriteLine("Keys: Left/A=Previous preview, Right/D=Next preview, R=Reset camera, O=Open output folder, H=Help, Esc=Quit");
   }
