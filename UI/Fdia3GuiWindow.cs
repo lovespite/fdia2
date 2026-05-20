@@ -55,6 +55,8 @@ public sealed class Fdia3GuiWindow : GameWindow
   int transferFunctionTextureId;
   bool hasVolumeTexture;
   float volumeValueScale = 1f;
+  float autoOpacityMultiplier = 1f;
+  bool useWhiteBackground = false;
 
   int hudShaderProgram;
   int hudVao;
@@ -173,7 +175,10 @@ public sealed class Fdia3GuiWindow : GameWindow
   protected override void OnRenderFrame(FrameEventArgs args)
   {
     base.OnRenderFrame(args);
-    GL.ClearColor(new Color4(0.05f, 0.05f, 0.08f, 1f));
+    if (useWhiteBackground)
+      GL.ClearColor(new Color4(0.95f, 0.95f, 0.95f, 1f));
+    else
+      GL.ClearColor(new Color4(0.05f, 0.05f, 0.08f, 1f));
     GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
     RenderReferenceGeometry();
@@ -255,6 +260,10 @@ public sealed class Fdia3GuiWindow : GameWindow
         break;
       case Keys.H:
         PrintHelp();
+        break;
+      case Keys.B:
+        useWhiteBackground = !useWhiteBackground;
+        status = useWhiteBackground ? "Switched to white background" : "Switched to dark background";
         break;
     }
 
@@ -543,13 +552,13 @@ public sealed class Fdia3GuiWindow : GameWindow
     var lines = new List<string>
     {
       $"Mode: {renderMode}",
-      $"Dens: {densityGain:F2} | Opac: {opacityGain:F2}",
+      $"Dens: {densityGain:F2} | Opac: {opacityGain:F2} (Auto x{autoOpacityMultiplier:F1})",
       $"Clip: {clipState}",
       $"Pending: {pendingFiles.Count} | Preview: {previewStatus}",
       $"Points: {pointCount:N0} | Busy: {isBusy}",
       $"Origin(0,0,0): ({ReferenceOrigin.X:F1},{ReferenceOrigin.Y:F1},{ReferenceOrigin.Z:F1})",
       $"Status: {status}",
-      "Keys: F1-F4 Mode | C Clip | [ ] ClipOffset",
+      "Keys: F1-F4 Mode | C Clip | [ ] ClipOffset | B BG",
       "      , . Density | - = Opacity | <- -> Preview | R Reset",
     };
 
@@ -608,7 +617,9 @@ public sealed class Fdia3GuiWindow : GameWindow
       return false;
 
     UploadVolumeTexture(volumeData.Voxels);
-    volumeValueScale = ComputeVolumeValueScale(volumeData.Voxels);
+    var (scale, autoOpacity) = ComputeVolumeValueScale(volumeData.Voxels);
+    volumeValueScale = scale;
+    autoOpacityMultiplier = autoOpacity;
     var vertices = BuildPointCloudVertices(volumeData, out var loadedPointCount);
     UploadPointCloud(vertices, loadedPointCount);
     previewIndex = normalizedIndex;
@@ -683,16 +694,30 @@ public sealed class Fdia3GuiWindow : GameWindow
     volumeValueScale = 1f;
   }
 
-  static float ComputeVolumeValueScale(ushort[] voxels)
+  static (float Scale, float AutoOpacity) ComputeVolumeValueScale(ushort[] voxels)
   {
     ushort maxValue = 0;
+    double sumValue = 0;
+    int nonZeroCount = 0;
+
     foreach (var value in voxels)
     {
       if (value > maxValue)
         maxValue = value;
+      if (value > 0)
+      {
+        sumValue += value;
+        nonZeroCount++;
+      }
     }
 
-    return maxValue == 0 ? 1f : ushort.MaxValue / (float)maxValue;
+    float scale = maxValue == 0 ? 1f : ushort.MaxValue / (float)maxValue;
+    float meanDensity = nonZeroCount == 0 ? 0f : (float)(sumValue / nonZeroCount) / ushort.MaxValue;
+    
+    // Calculate auto-multiplier: target a mean density visibility of ~0.25
+    float autoOpacity = Math.Clamp(0.25f / MathF.Max(meanDensity, 0.005f), 1f, 15f);
+
+    return (scale, autoOpacity);
   }
 
   void UploadPointCloud(float[] vertices, int loadedPointCount)
@@ -1361,7 +1386,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uStepSize"), RayStepSize);
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uDensityGain"), densityGain);
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uVolumeValueScale"), volumeValueScale);
-    GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uOpacityGain"), opacityGain);
+    GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uOpacityGain"), opacityGain * autoOpacityMultiplier);
     GL.Uniform1(GL.GetUniformLocation(volumeShaderProgram, "uEarlyTerminateAlpha"), EarlyTerminateAlpha);
     
     int shaderMode = 0;
