@@ -1,9 +1,13 @@
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.MemoryMappedFiles;
+using System.Runtime;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 
 namespace Fdia2.Core;
 
@@ -16,11 +20,19 @@ public static class VolumeProcessor
     const int BytesPerVoxel = sizeof(uint);
     const int GroupSize = 3;
     const int StreamBufferSize = 256 * 1024;
-    const int MappedBufferSize = StreamBufferSize - (StreamBufferSize % GroupSize);
+    // Keep mapped read buffer just under the LOH threshold (85,000 bytes) so each
+    // AccumulateMappedRange call doesn't allocate on the LOH; must stay a multiple of GroupSize.
+    const int MappedBufferSize = 84_000;
     const long LargeFileThresholdBytes = 50L * 1024 * 1024;
     const int MaxChunkWorkers = 4;
     const string RawEntryName = "volume.raw";
     const string MetaEntryName = "meta.json";
+
+    // Volumes are 64MB each (LOH). Pool them across files so we don't churn LOH segments.
+    // Pool size is intentionally generous: peak concurrent in-flight = scan workers + save queue
+    // capacity + save workers + chunked-path locals (up to MaxChunkWorkers per scan).
+    static readonly ArrayPool<uint> VolumePool =
+      ArrayPool<uint>.Create(maxArrayLength: VoxelCount, maxArraysPerBucket: 32);
 
     sealed class VolumeZipMetadata
     {
@@ -60,6 +72,8 @@ public static class VolumeProcessor
         public required IReadOnlyList<ProcessingFileProgress> ActiveFiles { get; init; }
     }
 
+    const int ScanProgressMax = 80;
+
     public static List<string> ProcessFiles(IEnumerable<string> filePaths, string outputDir) =>
       ProcessFiles(filePaths, outputDir, null);
 
@@ -79,23 +93,67 @@ public static class VolumeProcessor
           : new ProcessingProgressTracker(inputFiles, pipelineLimit, progressCallback);
         tracker?.PublishSnapshot();
 
-        Parallel.ForEach(inputFiles, new ParallelOptions { MaxDegreeOfParallelism = pipelineLimit }, item =>
+        // Decouple scan from save so completed scan slots are released immediately
+        // and don't get blocked by zip compression. Bounded channel caps in-flight
+        // memory (each volume is ~64MB).
+        var saveCapacity = Math.Max(1, pipelineLimit);
+        var saveChannel = Channel.CreateBounded<SavePayload>(new BoundedChannelOptions(saveCapacity)
         {
-            tracker?.MarkRunning(item.Index);
-            try
-            {
-                Console.WriteLine($"Processing file: '{item.Path}'...");
-                var outputFile = ProcessFile(item.Path, outputDir, pipelineLimit, tracker?.CreateFileProgressReporter(item.Index));
-                outputFiles[item.Index] = outputFile;
-                tracker?.MarkSucceeded(item.Index);
-                Console.WriteLine($"DONE! '{item.Path}' -> '{outputFile}'");
-            }
-            catch (Exception ex)
-            {
-                tracker?.MarkFailed(item.Index);
-                Console.WriteLine($"FAIL! Skipped file '{item.Path}': {ex.Message}");
-            }
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = false,
         });
+
+        var saveWorkerCount = Math.Max(1, pipelineLimit);
+        var saveWorkers = new Task[saveWorkerCount];
+        for (int i = 0; i < saveWorkerCount; i++)
+        {
+            saveWorkers[i] = Task.Run(async () =>
+            {
+                await foreach (var payload in saveChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+                {
+                    RunSaveStage(payload, outputDir, outputFiles, tracker);
+                }
+            });
+        }
+
+        // NoBuffering: each worker takes ONE item at a time, so short files release
+        // slots immediately instead of being trapped in a pre-assigned range partition.
+        var partitioner = Partitioner.Create(inputFiles, EnumerablePartitionerOptions.NoBuffering);
+        try
+        {
+            Parallel.ForEach(
+              partitioner,
+              new ParallelOptions { MaxDegreeOfParallelism = pipelineLimit },
+              item =>
+              {
+                  tracker?.MarkRunning(item.Index);
+                  uint[] volume;
+                  try
+                  {
+                      Console.WriteLine($"Scanning file: '{item.Path}'...");
+                      volume = ScanFile(item.Path, pipelineLimit, tracker?.CreateScanProgressReporter(item.Index));
+                  }
+                  catch (Exception ex)
+                  {
+                      tracker?.MarkFailed(item.Index);
+                      Console.WriteLine($"FAIL! Skipped file '{item.Path}': {ex.Message}");
+                      return;
+                  }
+
+                  tracker?.MarkSaving(item.Index, ScanProgressMax);
+                  // Block briefly here only when save pipeline is saturated; otherwise the scan
+                  // worker returns immediately to grab the next file from the partitioner.
+                  saveChannel.Writer.WriteAsync(new SavePayload(item.Index, item.Path, volume))
+                    .AsTask().GetAwaiter().GetResult();
+              });
+        }
+        finally
+        {
+            saveChannel.Writer.Complete();
+        }
+
+        Task.WaitAll(saveWorkers);
 
         tracker?.StopAndPublishFinalSnapshot();
 
@@ -106,40 +164,89 @@ public static class VolumeProcessor
                 completed.Add(outputFile);
         }
 
+        // Batch is finished. Return the LOH segments held by pooled 64MB volumes back to the OS:
+        // schedule a one-shot LOH compaction + a full blocking compacting Gen2 collection. Without
+        // this, LOH segments remain committed in the working set and look like a memory leak.
+        ReleaseLargeObjectHeap();
+
         return completed;
     }
 
-    static string ProcessFile(
-      string filePath,
+    static void ReleaseLargeObjectHeap()
+    {
+        GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+    }
+
+    readonly record struct SavePayload(int Index, string SourcePath, uint[] Volume);
+
+    static void RunSaveStage(
+      SavePayload payload,
       string outputDir,
+      string?[] outputFiles,
+      ProcessingProgressTracker? tracker)
+    {
+        try
+        {
+            tracker?.UpdateProgressPercent(payload.Index, 90);
+            var outputFilePath = Path.Combine(outputDir, Path.GetFileName(payload.SourcePath) + Fd3Extension);
+            SaveVolumeZip(payload.Volume, payload.SourcePath, outputFilePath);
+            outputFiles[payload.Index] = outputFilePath;
+            tracker?.MarkSucceeded(payload.Index);
+            Console.WriteLine($"DONE! '{payload.SourcePath}' -> '{outputFilePath}'");
+        }
+        catch (Exception ex)
+        {
+            tracker?.MarkFailed(payload.Index);
+            Console.WriteLine($"FAIL! Save failed for '{payload.SourcePath}': {ex.Message}");
+        }
+        finally
+        {
+            // Return the pooled 64MB volume buffer regardless of save outcome.
+            VolumePool.Return(payload.Volume, clearArray: false);
+        }
+    }
+
+    static uint[] ScanFile(
+      string filePath,
       int pipelineLimit,
       Action<int>? reportProgress)
     {
         if (!File.Exists(filePath))
             throw new FileNotFoundException("File not found: " + filePath);
 
-        var volume = new uint[VoxelCount];
-        var fileInfo = new FileInfo(filePath);
-        var mappedBytesLength = (fileInfo.Length / GroupSize) * GroupSize;
-        if (ShouldUseChunkedMappedPath(filePath, fileInfo))
+        var volume = VolumePool.Rent(VoxelCount);
+        // Pool doesn't guarantee zeroed memory and the rented array length may exceed VoxelCount.
+        Array.Clear(volume, 0, VoxelCount);
+        try
         {
-            var progress = CreateFileProgressCounter(mappedBytesLength, reportProgress);
-            FillVolumeMapped(filePath, fileInfo.Length, volume, pipelineLimit, progress);
-            progress?.Complete();
+            var fileInfo = new FileInfo(filePath);
+            var mappedBytesLength = (fileInfo.Length / GroupSize) * GroupSize;
+            if (ShouldUseChunkedMappedPath(filePath, fileInfo))
+            {
+                var progress = CreateFileProgressCounter(mappedBytesLength, reportProgress);
+                FillVolumeMapped(filePath, fileInfo.Length, volume, pipelineLimit, progress);
+                progress?.Complete();
+            }
+            else
+            {
+                using var stream = HeatmapProcessor.GetDataStream(filePath);
+                var buffer = new byte[StreamBufferSize];
+                var totalBytes = ResolveReadableLength(stream, fileInfo.Length);
+                var progress = CreateFileProgressCounter(totalBytes, reportProgress);
+                FillVolume(stream, volume, buffer, progress);
+                progress?.Complete();
+            }
         }
-        else
+        catch
         {
-            using var stream = HeatmapProcessor.GetDataStream(filePath);
-            var buffer = new byte[StreamBufferSize];
-            var totalBytes = ResolveReadableLength(stream, fileInfo.Length);
-            var progress = CreateFileProgressCounter(totalBytes, reportProgress);
-            FillVolume(stream, volume, buffer, progress);
-            progress?.Complete();
+            VolumePool.Return(volume, clearArray: false);
+            throw;
         }
 
-        var outputFilePath = Path.Combine(outputDir, Path.GetFileName(filePath) + Fd3Extension);
-        SaveVolumeZip(volume, filePath, outputFilePath);
-        return outputFilePath;
+        return volume;
     }
 
     static int ResolvePipelineLimit(int fileCount)
@@ -206,26 +313,49 @@ public static class VolumeProcessor
         }
 
         var localVolumes = new uint[workerCount][];
-        Parallel.For(0, workerCount, workerIndex =>
+        try
         {
-            var startGroup = workerIndex * totalGroups / workerCount;
-            var endGroup = (workerIndex + 1) * totalGroups / workerCount;
-            var byteLength = (endGroup - startGroup) * GroupSize;
-            if (byteLength <= 0)
-                return;
+            Parallel.For(0, workerCount, workerIndex =>
+            {
+                var startGroup = workerIndex * totalGroups / workerCount;
+                var endGroup = (workerIndex + 1) * totalGroups / workerCount;
+                var byteLength = (endGroup - startGroup) * GroupSize;
+                if (byteLength <= 0)
+                    return;
 
-            var localVolume = new uint[VoxelCount];
-            var byteOffset = startGroup * GroupSize;
-            AccumulateMappedRange(mappedFile, byteOffset, byteLength, localVolume, progress);
-            localVolumes[workerIndex] = localVolume;
-        });
+                var localVolume = VolumePool.Rent(VoxelCount);
+                Array.Clear(localVolume, 0, VoxelCount);
+                try
+                {
+                    var byteOffset = startGroup * GroupSize;
+                    AccumulateMappedRange(mappedFile, byteOffset, byteLength, localVolume, progress);
+                    localVolumes[workerIndex] = localVolume;
+                }
+                catch
+                {
+                    VolumePool.Return(localVolume, clearArray: false);
+                    throw;
+                }
+            });
 
-        foreach (var localVolume in localVolumes)
+            foreach (var localVolume in localVolumes)
+            {
+                if (localVolume is null)
+                    continue;
+
+                MergeVolumeSaturating(volume, localVolume);
+            }
+        }
+        finally
         {
-            if (localVolume is null)
-                continue;
-
-            MergeVolumeSaturating(volume, localVolume);
+            for (int i = 0; i < localVolumes.Length; i++)
+            {
+                var localVolume = localVolumes[i];
+                if (localVolume is null)
+                    continue;
+                localVolumes[i] = null!;
+                VolumePool.Return(localVolume, clearArray: false);
+            }
         }
     }
 
@@ -281,7 +411,7 @@ public static class VolumeProcessor
 
     static void MergeVolumeSaturating(uint[] destination, uint[] source)
     {
-        for (int i = 0; i < destination.Length; i++)
+        for (int i = 0; i < VoxelCount; i++)
         {
             var add = source[i];
             if (add == 0)
@@ -380,6 +510,7 @@ public static class VolumeProcessor
         {
             Pending,
             Running,
+            Saving,
             Succeeded,
             Failed,
         }
@@ -422,6 +553,34 @@ public static class VolumeProcessor
 
         public Action<int> CreateFileProgressReporter(int index) => percent => UpdateProgressPercent(index, percent);
 
+        // Scan-stage progress is reported in 0..100 by the scanner but is mapped to
+        // 0..ScanProgressMax so the remaining range is reserved for the save stage.
+        public Action<int> CreateScanProgressReporter(int index) => percent =>
+        {
+            var scaled = (int)Math.Clamp((long)percent * ScanProgressMax / 100, 0, ScanProgressMax);
+            UpdateProgressPercent(index, scaled);
+        };
+
+        public void MarkSaving(int index, int progressPercent)
+        {
+            var normalized = Math.Clamp(progressPercent, 0, 100);
+            if (!Mutate(index, entry =>
+            {
+                if (entry.State != FileRuntimeState.Running)
+                    return false;
+
+                entry.State = FileRuntimeState.Saving;
+                if (normalized > entry.ProgressPercent)
+                    entry.ProgressPercent = normalized;
+                return true;
+            }))
+            {
+                return;
+            }
+
+            PublishSnapshot();
+        }
+
         public void MarkRunning(int index)
         {
             if (!Mutate(index, entry =>
@@ -446,7 +605,7 @@ public static class VolumeProcessor
         {
             if (!Mutate(index, entry =>
             {
-                if (entry.State != FileRuntimeState.Running)
+                if (entry.State != FileRuntimeState.Running && entry.State != FileRuntimeState.Saving)
                     return false;
 
                 entry.State = FileRuntimeState.Succeeded;
@@ -466,7 +625,7 @@ public static class VolumeProcessor
         {
             if (!Mutate(index, entry =>
             {
-                if (entry.State != FileRuntimeState.Running)
+                if (entry.State != FileRuntimeState.Running && entry.State != FileRuntimeState.Saving)
                     return false;
 
                 entry.State = FileRuntimeState.Failed;
@@ -486,7 +645,7 @@ public static class VolumeProcessor
             var normalized = Math.Clamp(progressPercent, 0, 100);
             if (!Mutate(index, entry =>
             {
-                if (entry.State != FileRuntimeState.Running)
+                if (entry.State != FileRuntimeState.Running && entry.State != FileRuntimeState.Saving)
                     return false;
                 if (normalized <= entry.ProgressPercent)
                     return false;
@@ -513,7 +672,7 @@ public static class VolumeProcessor
             lock (sync)
             {
                 var activeFiles = files
-                  .Where(file => file.State == FileRuntimeState.Running)
+                  .Where(file => file.State == FileRuntimeState.Running || file.State == FileRuntimeState.Saving)
                   .Select(file => new ProcessingFileProgress
                   {
                       FilePath = file.FilePath,
@@ -559,14 +718,13 @@ public static class VolumeProcessor
 
     public static void SaveVolumeZip(uint[] volume, string sourceFilePath, string outputZipPath)
     {
-        if (volume.Length != VoxelCount)
-            throw new ArgumentException($"Volume length must be {VoxelCount}.", nameof(volume));
+        if (volume.Length < VoxelCount)
+            throw new ArgumentException($"Volume length must be at least {VoxelCount}.", nameof(volume));
 
         Directory.CreateDirectory(Path.GetDirectoryName(outputZipPath) ?? ".");
         if (File.Exists(outputZipPath))
             File.Delete(outputZipPath);
 
-        var rawBytes = SerializeVolume(volume);
         var metadata = new VolumeZipMetadata
         {
             SourceFileName = Path.GetFileName(sourceFilePath),
@@ -579,11 +737,45 @@ public static class VolumeProcessor
 
         var rawEntry = zip.CreateEntry(RawEntryName, CompressionLevel.SmallestSize);
         using (var rawStream = rawEntry.Open())
-            rawStream.Write(rawBytes);
+            WriteVolumeLittleEndian(rawStream, volume);
 
         var metaEntry = zip.CreateEntry(MetaEntryName, CompressionLevel.SmallestSize);
         using (var metaWriter = new StreamWriter(metaEntry.Open()))
             metaWriter.Write(metaJson);
+    }
+
+    // Streams the volume to the destination in small pooled chunks so we never allocate
+    // a 64 MB byte[] on the LOH for serialization.
+    static void WriteVolumeLittleEndian(Stream destination, uint[] volume)
+    {
+        const int ChunkBytes = 64 * 1024;                       // well below LOH threshold
+        const int VoxelsPerChunk = ChunkBytes / BytesPerVoxel;
+
+        var buffer = ArrayPool<byte>.Shared.Rent(ChunkBytes);
+        try
+        {
+            for (int offset = 0; offset < VoxelCount; offset += VoxelsPerChunk)
+            {
+                var count = Math.Min(VoxelsPerChunk, VoxelCount - offset);
+                var byteCount = count * BytesPerVoxel;
+
+                if (BitConverter.IsLittleEndian)
+                {
+                    Buffer.BlockCopy(volume, offset * BytesPerVoxel, buffer, 0, byteCount);
+                }
+                else
+                {
+                    for (int i = 0; i < count; i++)
+                        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(i * BytesPerVoxel, BytesPerVoxel), volume[offset + i]);
+                }
+
+                destination.Write(buffer, 0, byteCount);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     public static VolumeData LoadVolumeZip(string zipFilePath)
@@ -824,9 +1016,9 @@ public static class VolumeProcessor
     static long CountNonZero(uint[] volume)
     {
         long count = 0;
-        foreach (var value in volume)
+        for (int i = 0; i < VoxelCount; i++)
         {
-            if (value > 0)
+            if (volume[i] > 0)
                 count++;
         }
         return count;
