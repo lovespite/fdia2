@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO.Compression;
+using System.IO.MemoryMappedFiles;
 using System.Text;
 using System.Text.Json;
 
@@ -10,8 +12,13 @@ public static class VolumeProcessor
     public const int AxisLength = 256;
     public const int VoxelCount = AxisLength * AxisLength * AxisLength;
     public const string Fd3Extension = ".fd3";
+    public static int MaxParallelPipelines { get; set; } = Math.Max(1, Environment.ProcessorCount / 2 + 1);
     const int BytesPerVoxel = sizeof(uint);
     const int GroupSize = 3;
+    const int StreamBufferSize = 256 * 1024;
+    const int MappedBufferSize = StreamBufferSize - (StreamBufferSize % GroupSize);
+    const long LargeFileThresholdBytes = 50L * 1024 * 1024;
+    const int MaxChunkWorkers = 4;
     const string RawEntryName = "volume.raw";
     const string MetaEntryName = "meta.json";
 
@@ -34,43 +41,259 @@ public static class VolumeProcessor
         public long NonZeroVoxelCount { get; init; }
     }
 
-    public static List<string> ProcessFiles(IEnumerable<string> filePaths, string outputDir)
+    public sealed class ProcessingFileProgress
     {
-        var outputFiles = new List<string>();
-        var buffer = new byte[256 * 1024];
-        foreach (var filePath in filePaths)
+        public required string FilePath { get; init; }
+        public required string FileName { get; init; }
+        public int ProgressPercent { get; init; }
+    }
+
+    public sealed class ProcessingProgressSnapshot
+    {
+        public required int TotalFiles { get; init; }
+        public required int PendingFiles { get; init; }
+        public required int RunningFiles { get; init; }
+        public required int SucceededFiles { get; init; }
+        public required int FailedFiles { get; init; }
+        public required int MaxParallelPipelines { get; init; }
+        public required TimeSpan Elapsed { get; init; }
+        public required IReadOnlyList<ProcessingFileProgress> ActiveFiles { get; init; }
+    }
+
+    public static List<string> ProcessFiles(IEnumerable<string> filePaths, string outputDir) =>
+      ProcessFiles(filePaths, outputDir, null);
+
+    public static List<string> ProcessFiles(
+      IEnumerable<string> filePaths,
+      string outputDir,
+      Action<ProcessingProgressSnapshot>? progressCallback)
+    {
+        var inputFiles = filePaths.Select((path, index) => (Path: path, Index: index)).ToArray();
+        if (inputFiles.Length == 0)
+            return [];
+
+        var pipelineLimit = ResolvePipelineLimit(inputFiles.Length);
+        var outputFiles = new string?[inputFiles.Length];
+        var tracker = progressCallback is null
+          ? null
+          : new ProcessingProgressTracker(inputFiles, pipelineLimit, progressCallback);
+        tracker?.PublishSnapshot();
+
+        Parallel.ForEach(inputFiles, new ParallelOptions { MaxDegreeOfParallelism = pipelineLimit }, item =>
         {
+            tracker?.MarkRunning(item.Index);
             try
             {
-                Console.WriteLine($"Processing file: '{filePath}'...");
-                var outputFile = ProcessFile(filePath, outputDir, buffer);
-                outputFiles.Add(outputFile);
-                Console.WriteLine($"DONE! '{filePath}' -> '{outputFile}'");
+                Console.WriteLine($"Processing file: '{item.Path}'...");
+                var outputFile = ProcessFile(item.Path, outputDir, pipelineLimit, tracker?.CreateFileProgressReporter(item.Index));
+                outputFiles[item.Index] = outputFile;
+                tracker?.MarkSucceeded(item.Index);
+                Console.WriteLine($"DONE! '{item.Path}' -> '{outputFile}'");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"FAIL! Skipped file '{filePath}': {ex.Message}");
+                tracker?.MarkFailed(item.Index);
+                Console.WriteLine($"FAIL! Skipped file '{item.Path}': {ex.Message}");
             }
+        });
+
+        tracker?.StopAndPublishFinalSnapshot();
+
+        var completed = new List<string>(inputFiles.Length);
+        foreach (var outputFile in outputFiles)
+        {
+            if (!string.IsNullOrWhiteSpace(outputFile))
+                completed.Add(outputFile);
         }
 
-        return outputFiles;
+        return completed;
     }
 
-    static string ProcessFile(string filePath, string outputDir, byte[] buffer)
+    static string ProcessFile(
+      string filePath,
+      string outputDir,
+      int pipelineLimit,
+      Action<int>? reportProgress)
     {
         if (!File.Exists(filePath))
             throw new FileNotFoundException("File not found: " + filePath);
 
-        using var stream = HeatmapProcessor.GetDataStream(filePath);
         var volume = new uint[VoxelCount];
-        FillVolume(stream, volume, buffer);
+        var fileInfo = new FileInfo(filePath);
+        var mappedBytesLength = (fileInfo.Length / GroupSize) * GroupSize;
+        if (ShouldUseChunkedMappedPath(filePath, fileInfo))
+        {
+            var progress = CreateFileProgressCounter(mappedBytesLength, reportProgress);
+            FillVolumeMapped(filePath, fileInfo.Length, volume, pipelineLimit, progress);
+            progress?.Complete();
+        }
+        else
+        {
+            using var stream = HeatmapProcessor.GetDataStream(filePath);
+            var buffer = new byte[StreamBufferSize];
+            var totalBytes = ResolveReadableLength(stream, fileInfo.Length);
+            var progress = CreateFileProgressCounter(totalBytes, reportProgress);
+            FillVolume(stream, volume, buffer, progress);
+            progress?.Complete();
+        }
 
         var outputFilePath = Path.Combine(outputDir, Path.GetFileName(filePath) + Fd3Extension);
         SaveVolumeZip(volume, filePath, outputFilePath);
         return outputFilePath;
     }
 
-    static void FillVolume(Stream stream, uint[] volume, byte[] buffer)
+    static int ResolvePipelineLimit(int fileCount)
+    {
+        var configuredLimit = MaxParallelPipelines > 0 ? MaxParallelPipelines : 1;
+        return Math.Clamp(configuredLimit, 1, Math.Max(1, fileCount));
+    }
+
+    static bool ShouldUseChunkedMappedPath(string filePath, FileInfo fileInfo)
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+        if (fileInfo.Length <= LargeFileThresholdBytes || fileInfo.Length < GroupSize)
+            return false;
+        if (HeatmapProcessor.IsImageFile(filePath))
+            return false;
+
+        return true;
+    }
+
+    static FileProgressCounter? CreateFileProgressCounter(long totalBytes, Action<int>? reportProgress)
+    {
+        if (reportProgress is null)
+            return null;
+
+        return new FileProgressCounter(totalBytes, reportProgress);
+    }
+
+    static long ResolveReadableLength(Stream stream, long fallbackLength)
+    {
+        if (stream.CanSeek)
+        {
+            try
+            {
+                var streamLength = stream.Length;
+                if (streamLength > 0)
+                    return streamLength;
+            }
+            catch (NotSupportedException)
+            {
+            }
+        }
+
+        return Math.Max(1, fallbackLength);
+    }
+
+    static void FillVolumeMapped(
+      string filePath,
+      long fileLength,
+      uint[] volume,
+      int pipelineLimit,
+      FileProgressCounter? progress)
+    {
+        var totalGroups = fileLength / GroupSize;
+        if (totalGroups <= 0)
+            return;
+
+        using var mappedFile = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+        var workerCount = ResolveChunkWorkerCount(totalGroups, pipelineLimit);
+        if (workerCount <= 1)
+        {
+            AccumulateMappedRange(mappedFile, 0, totalGroups * GroupSize, volume, progress);
+            return;
+        }
+
+        var localVolumes = new uint[workerCount][];
+        Parallel.For(0, workerCount, workerIndex =>
+        {
+            var startGroup = workerIndex * totalGroups / workerCount;
+            var endGroup = (workerIndex + 1) * totalGroups / workerCount;
+            var byteLength = (endGroup - startGroup) * GroupSize;
+            if (byteLength <= 0)
+                return;
+
+            var localVolume = new uint[VoxelCount];
+            var byteOffset = startGroup * GroupSize;
+            AccumulateMappedRange(mappedFile, byteOffset, byteLength, localVolume, progress);
+            localVolumes[workerIndex] = localVolume;
+        });
+
+        foreach (var localVolume in localVolumes)
+        {
+            if (localVolume is null)
+                continue;
+
+            MergeVolumeSaturating(volume, localVolume);
+        }
+    }
+
+    static int ResolveChunkWorkerCount(long totalGroups, int pipelineLimit)
+    {
+        if (totalGroups <= 1 || Environment.ProcessorCount <= 1)
+            return 1;
+
+        var safePipelineLimit = Math.Max(1, pipelineLimit);
+        var cpuBudget = Math.Max(1, Environment.ProcessorCount / safePipelineLimit);
+        var workerCount = Math.Clamp(cpuBudget, 1, MaxChunkWorkers);
+
+        if (workerCount == 1 && totalGroups > 1 && Environment.ProcessorCount > 1)
+            workerCount = Math.Min(MaxChunkWorkers, Environment.ProcessorCount);
+
+        if (totalGroups < workerCount)
+            workerCount = (int)totalGroups;
+
+        return Math.Max(1, workerCount);
+    }
+
+    static void AccumulateMappedRange(
+      MemoryMappedFile mappedFile,
+      long byteOffset,
+      long byteLength,
+      uint[] targetVolume,
+      FileProgressCounter? progress)
+    {
+        if (byteLength <= 0)
+            return;
+
+        using var accessor = mappedFile.CreateViewAccessor(byteOffset, byteLength, MemoryMappedFileAccess.Read);
+        var buffer = new byte[MappedBufferSize];
+        long position = 0;
+        while (position < byteLength)
+        {
+            var requestLength = (int)Math.Min(buffer.Length, byteLength - position);
+            var read = accessor.ReadArray(position, buffer, 0, requestLength);
+            if (read <= 0)
+                break;
+
+            var alignedRead = read - (read % GroupSize);
+            for (int i = 0; i < alignedRead; i += GroupSize)
+                IncrementVoxel(targetVolume, buffer[i], buffer[i + 1], buffer[i + 2]);
+            progress?.AddProcessedBytes(alignedRead);
+
+            if (alignedRead <= 0)
+                break;
+
+            position += alignedRead;
+        }
+    }
+
+    static void MergeVolumeSaturating(uint[] destination, uint[] source)
+    {
+        for (int i = 0; i < destination.Length; i++)
+        {
+            var add = source[i];
+            if (add == 0)
+                continue;
+
+            var current = destination[i];
+            var sum = (ulong)current + add;
+            destination[i] = sum > uint.MaxValue ? uint.MaxValue : (uint)sum;
+        }
+    }
+
+    static void FillVolume(Stream stream, uint[] volume, byte[] buffer, FileProgressCounter? progress)
     {
         Span<byte> carry = stackalloc byte[GroupSize];
         var carryCount = 0;
@@ -78,6 +301,7 @@ public static class VolumeProcessor
         int read;
         while ((read = stream.Read(buffer)) > 0)
         {
+            progress?.AddProcessedBytes(read);
             var span = buffer.AsSpan(0, read);
             var offset = 0;
 
@@ -103,6 +327,223 @@ public static class VolumeProcessor
             carryCount = span.Length - tailStart;
             for (int i = 0; i < carryCount; i++)
                 carry[i] = span[tailStart + i];
+        }
+    }
+
+    sealed class FileProgressCounter
+    {
+        readonly long totalBytes;
+        readonly Action<int> reportProgress;
+        long processedBytes;
+        int lastPercent = -1;
+
+        public FileProgressCounter(long totalBytes, Action<int> reportProgress)
+        {
+            this.totalBytes = Math.Max(1, totalBytes);
+            this.reportProgress = reportProgress;
+        }
+
+        public void AddProcessedBytes(long bytes)
+        {
+            if (bytes <= 0)
+                return;
+
+            var processed = Interlocked.Add(ref processedBytes, bytes);
+            var percent = (int)Math.Clamp(processed * 100 / totalBytes, 0, 99);
+            PublishPercent(percent);
+        }
+
+        public void Complete()
+        {
+            PublishPercent(100);
+        }
+
+        void PublishPercent(int percent)
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref lastPercent);
+                if (percent <= current)
+                    return;
+                if (Interlocked.CompareExchange(ref lastPercent, percent, current) == current)
+                {
+                    reportProgress(percent);
+                    return;
+                }
+            }
+        }
+    }
+
+    sealed class ProcessingProgressTracker
+    {
+        enum FileRuntimeState
+        {
+            Pending,
+            Running,
+            Succeeded,
+            Failed,
+        }
+
+        sealed class FileRuntimeEntry
+        {
+            public required string FilePath { get; init; }
+            public required string FileName { get; init; }
+            public FileRuntimeState State { get; set; }
+            public int ProgressPercent { get; set; }
+        }
+
+        readonly object sync = new();
+        readonly Action<ProcessingProgressSnapshot> publish;
+        readonly FileRuntimeEntry[] files;
+        readonly Stopwatch elapsed = Stopwatch.StartNew();
+        readonly int maxParallelPipelines;
+        int pendingFiles;
+        int runningFiles;
+        int succeededFiles;
+        int failedFiles;
+
+        public ProcessingProgressTracker((string Path, int Index)[] inputFiles, int maxParallelPipelines, Action<ProcessingProgressSnapshot> publish)
+        {
+            this.publish = publish;
+            this.maxParallelPipelines = maxParallelPipelines;
+            files = new FileRuntimeEntry[inputFiles.Length];
+            pendingFiles = inputFiles.Length;
+            foreach (var item in inputFiles)
+            {
+                files[item.Index] = new FileRuntimeEntry
+                {
+                    FilePath = item.Path,
+                    FileName = Path.GetFileName(item.Path),
+                    State = FileRuntimeState.Pending,
+                    ProgressPercent = 0,
+                };
+            }
+        }
+
+        public Action<int> CreateFileProgressReporter(int index) => percent => UpdateProgressPercent(index, percent);
+
+        public void MarkRunning(int index)
+        {
+            if (!Mutate(index, entry =>
+            {
+                if (entry.State != FileRuntimeState.Pending)
+                    return false;
+
+                entry.State = FileRuntimeState.Running;
+                entry.ProgressPercent = 0;
+                pendingFiles--;
+                runningFiles++;
+                return true;
+            }))
+            {
+                return;
+            }
+
+            PublishSnapshot();
+        }
+
+        public void MarkSucceeded(int index)
+        {
+            if (!Mutate(index, entry =>
+            {
+                if (entry.State != FileRuntimeState.Running)
+                    return false;
+
+                entry.State = FileRuntimeState.Succeeded;
+                entry.ProgressPercent = 100;
+                runningFiles--;
+                succeededFiles++;
+                return true;
+            }))
+            {
+                return;
+            }
+
+            PublishSnapshot();
+        }
+
+        public void MarkFailed(int index)
+        {
+            if (!Mutate(index, entry =>
+            {
+                if (entry.State != FileRuntimeState.Running)
+                    return false;
+
+                entry.State = FileRuntimeState.Failed;
+                runningFiles--;
+                failedFiles++;
+                return true;
+            }))
+            {
+                return;
+            }
+
+            PublishSnapshot();
+        }
+
+        public void UpdateProgressPercent(int index, int progressPercent)
+        {
+            var normalized = Math.Clamp(progressPercent, 0, 100);
+            if (!Mutate(index, entry =>
+            {
+                if (entry.State != FileRuntimeState.Running)
+                    return false;
+                if (normalized <= entry.ProgressPercent)
+                    return false;
+
+                entry.ProgressPercent = normalized;
+                return true;
+            }))
+            {
+                return;
+            }
+
+            PublishSnapshot();
+        }
+
+        public void StopAndPublishFinalSnapshot()
+        {
+            elapsed.Stop();
+            PublishSnapshot();
+        }
+
+        public void PublishSnapshot()
+        {
+            ProcessingProgressSnapshot snapshot;
+            lock (sync)
+            {
+                var activeFiles = files
+                  .Where(file => file.State == FileRuntimeState.Running)
+                  .Select(file => new ProcessingFileProgress
+                  {
+                      FilePath = file.FilePath,
+                      FileName = file.FileName,
+                      ProgressPercent = file.ProgressPercent,
+                  })
+                  .ToArray();
+
+                snapshot = new ProcessingProgressSnapshot
+                {
+                    TotalFiles = files.Length,
+                    PendingFiles = pendingFiles,
+                    RunningFiles = runningFiles,
+                    SucceededFiles = succeededFiles,
+                    FailedFiles = failedFiles,
+                    MaxParallelPipelines = maxParallelPipelines,
+                    Elapsed = elapsed.Elapsed,
+                    ActiveFiles = activeFiles,
+                };
+            }
+
+            publish(snapshot);
+        }
+
+        bool Mutate(int index, Func<FileRuntimeEntry, bool> mutation)
+        {
+            lock (sync)
+            {
+                return mutation(files[index]);
+            }
         }
     }
 

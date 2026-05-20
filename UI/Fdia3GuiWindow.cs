@@ -27,10 +27,28 @@ public sealed class Fdia3GuiWindow : GameWindow
         Slice,
     }
 
+    sealed class ProcessingOverlayState
+    {
+        public bool IsVisible { get; set; }
+        public bool IsActive { get; set; }
+        public int TotalFiles { get; set; }
+        public int PendingFiles { get; set; }
+        public int RunningFiles { get; set; }
+        public int SucceededFiles { get; set; }
+        public int FailedFiles { get; set; }
+        public int MaxParallelPipelines { get; set; }
+        public TimeSpan Elapsed { get; set; }
+        public string Summary { get; set; } = string.Empty;
+        public List<VolumeProcessor.ProcessingFileProgress> ActiveFiles { get; } = [];
+    }
+
     readonly string outputDir;
     readonly List<string> pendingFiles;
     readonly bool viewOutputDir;
     readonly List<string> previewFiles = [];
+    readonly object processingOverlaySync = new();
+    readonly ProcessingOverlayState processingOverlay = new();
+    DateTimeOffset processingOverlayStartedUtc;
     Task<List<string>>? processingTask;
     int previewIndex = -1;
 
@@ -73,6 +91,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     float densityGain = DensityGainMax;
     float opacityGain = OpacityGainMax;
     string status = "Ready";
+    string hudFileName = "None";
     HudSliderTarget activeHudSlider = HudSliderTarget.None;
     Vector4 densitySliderRectPx;
     Vector4 opacitySliderRectPx;
@@ -465,6 +484,7 @@ public sealed class Fdia3GuiWindow : GameWindow
 
         if (filesToProcess.Count == 0)
         {
+            HideProcessingOverlay();
             if (directPreviewFiles.Count == 0)
             {
                 status = invalidFd3Count > 0
@@ -488,7 +508,8 @@ public sealed class Fdia3GuiWindow : GameWindow
             status += $" | {invalidFd3Count} invalid .fd3 skipped";
 
         Console.WriteLine(status);
-        processingTask = Task.Run(() => VolumeProcessor.ProcessFiles(filesToProcess, outputDir));
+        BeginProcessingOverlay(filesToProcess.Count);
+        processingTask = Task.Run(() => VolumeProcessor.ProcessFiles(filesToProcess, outputDir, OnProcessingProgress));
         UpdateWindowTitle();
     }
 
@@ -497,9 +518,12 @@ public sealed class Fdia3GuiWindow : GameWindow
         if (processingTask is not { IsCompleted: true })
             return;
 
+        var processedCount = 0;
+        var processingFailed = false;
         try
         {
             var outputFiles = processingTask.GetAwaiter().GetResult();
+            processedCount = outputFiles.Count;
             if (outputFiles.Count == 0)
             {
                 status = "No files were processed";
@@ -521,13 +545,114 @@ public sealed class Fdia3GuiWindow : GameWindow
         }
         catch (Exception ex)
         {
+            processingFailed = true;
             status = "Processing failed";
             Console.WriteLine("FAIL! Processing task failed: " + ex.GetBaseException().Message);
         }
         finally
         {
+            FinalizeProcessingOverlay(processedCount, processingFailed);
             processingTask = null;
         }
+    }
+
+    void BeginProcessingOverlay(int totalFiles)
+    {
+        lock (processingOverlaySync)
+        {
+            processingOverlayStartedUtc = DateTimeOffset.UtcNow;
+            processingOverlay.IsVisible = true;
+            processingOverlay.IsActive = true;
+            processingOverlay.TotalFiles = totalFiles;
+            processingOverlay.PendingFiles = totalFiles;
+            processingOverlay.RunningFiles = 0;
+            processingOverlay.SucceededFiles = 0;
+            processingOverlay.FailedFiles = 0;
+            processingOverlay.MaxParallelPipelines = Math.Min(VolumeProcessor.MaxParallelPipelines, totalFiles);
+            processingOverlay.Elapsed = TimeSpan.Zero;
+            processingOverlay.Summary = string.Empty;
+            processingOverlay.ActiveFiles.Clear();
+        }
+    }
+
+    void OnProcessingProgress(VolumeProcessor.ProcessingProgressSnapshot snapshot)
+    {
+        lock (processingOverlaySync)
+        {
+            processingOverlay.IsVisible = true;
+            processingOverlay.IsActive = snapshot.PendingFiles > 0 || snapshot.RunningFiles > 0;
+            processingOverlay.TotalFiles = snapshot.TotalFiles;
+            processingOverlay.PendingFiles = snapshot.PendingFiles;
+            processingOverlay.RunningFiles = snapshot.RunningFiles;
+            processingOverlay.SucceededFiles = snapshot.SucceededFiles;
+            processingOverlay.FailedFiles = snapshot.FailedFiles;
+            processingOverlay.MaxParallelPipelines = snapshot.MaxParallelPipelines;
+            processingOverlay.Elapsed = snapshot.Elapsed;
+            processingOverlay.ActiveFiles.Clear();
+            processingOverlay.ActiveFiles.AddRange(snapshot.ActiveFiles);
+            if (!processingOverlay.IsActive && processingOverlay.TotalFiles > 0)
+            {
+                processingOverlay.Summary = BuildProcessingSummary(
+                  processingOverlay.SucceededFiles,
+                  processingOverlay.FailedFiles,
+                  processingOverlay.Elapsed);
+            }
+        }
+    }
+
+    void HideProcessingOverlay()
+    {
+        lock (processingOverlaySync)
+        {
+            processingOverlay.IsVisible = false;
+            processingOverlay.IsActive = false;
+            processingOverlay.TotalFiles = 0;
+            processingOverlay.PendingFiles = 0;
+            processingOverlay.RunningFiles = 0;
+            processingOverlay.SucceededFiles = 0;
+            processingOverlay.FailedFiles = 0;
+            processingOverlay.MaxParallelPipelines = 0;
+            processingOverlay.Elapsed = TimeSpan.Zero;
+            processingOverlay.Summary = string.Empty;
+            processingOverlay.ActiveFiles.Clear();
+        }
+    }
+
+    void FinalizeProcessingOverlay(int succeededFiles, bool processingFailed)
+    {
+        lock (processingOverlaySync)
+        {
+            if (!processingOverlay.IsVisible)
+                return;
+
+            processingOverlay.IsActive = false;
+            processingOverlay.PendingFiles = 0;
+            processingOverlay.RunningFiles = 0;
+            processingOverlay.SucceededFiles = succeededFiles;
+            if (processingFailed && processingOverlay.TotalFiles > succeededFiles && processingOverlay.FailedFiles == 0)
+                processingOverlay.FailedFiles = processingOverlay.TotalFiles - succeededFiles;
+            if (processingOverlay.Elapsed <= TimeSpan.Zero)
+                processingOverlay.Elapsed = DateTimeOffset.UtcNow - processingOverlayStartedUtc;
+            processingOverlay.ActiveFiles.Clear();
+            processingOverlay.Summary = BuildProcessingSummary(
+              processingOverlay.SucceededFiles,
+              processingOverlay.FailedFiles,
+              processingOverlay.Elapsed);
+            if (processingFailed)
+                processingOverlay.Summary += " (task failed)";
+        }
+    }
+
+    static string BuildProcessingSummary(int succeededFiles, int failedFiles, TimeSpan elapsed) =>
+      $"Summary: succeeded {succeededFiles}, failed/skipped {failedFiles}, elapsed {FormatElapsed(elapsed)}";
+
+    static string FormatElapsed(TimeSpan elapsed)
+    {
+        if (elapsed < TimeSpan.Zero)
+            elapsed = TimeSpan.Zero;
+        return elapsed.TotalHours >= 1
+          ? elapsed.ToString(@"hh\:mm\:ss")
+          : elapsed.ToString(@"mm\:ss");
     }
 
     void UpdateWindowTitle() => UpdateWindowTitle(false);
@@ -555,16 +680,18 @@ public sealed class Fdia3GuiWindow : GameWindow
           : "None";
         var clipState = clippingEnabled ? $"On@{clipOffset:F2}" : "Off";
 
-        var sb = new System.Text.StringBuilder(512);
+        var sb = new System.Text.StringBuilder(2048);
         sb.Append("Mode: ").Append(renderMode).AppendLine();
         sb.Append("Dens: ").Append(densityGain.ToString("F2")).Append(" | Opac: ").Append(opacityGain.ToString("F2")).Append(" (Auto x").Append(autoOpacityMultiplier.ToString("F1")).AppendLine(")");
         sb.Append("Clip: ").Append(clipState).AppendLine();
         sb.Append("Pending: ").Append(pendingFiles.Count).Append(" | Preview: ").Append(previewStatus).AppendLine();
+        sb.Append("File: ").Append(hudFileName).AppendLine();
         sb.Append("Points: ").Append(pointCount.ToString("N0")).Append(" | Busy: ").Append(isBusy).AppendLine();
         sb.Append("Origin(0,0,0): (").Append(ReferenceOrigin.X.ToString("F1")).Append(',').Append(ReferenceOrigin.Y.ToString("F1")).Append(',').Append(ReferenceOrigin.Z.ToString("F1")).AppendLine(")");
         sb.Append("Status: ").Append(status).AppendLine();
         sb.AppendLine("Keys: F1-F4 Mode | C Clip | [ ] ClipOffset | B BG");
         sb.AppendLine("      , . Density | - = Opacity | <- -> Preview | R Reset");
+        AppendProcessingOverlaySection(sb);
 
         if (renderMode == RenderMode.VolumeComposite || renderMode == RenderMode.VolumeHybrid)
             sb.Append("Composite sliders: drag Density/Opacity bars below");
@@ -572,6 +699,57 @@ public sealed class Fdia3GuiWindow : GameWindow
             sb.Append("MIP slider: drag Slice bar below");
 
         return sb.ToString();
+    }
+
+    void AppendProcessingOverlaySection(System.Text.StringBuilder sb)
+    {
+        bool isVisible;
+        bool isActive;
+        int totalFiles;
+        int pendingFilesCount;
+        int runningFilesCount;
+        int succeededFiles;
+        int failedFiles;
+        int maxParallel;
+        TimeSpan elapsed;
+        string summary;
+        VolumeProcessor.ProcessingFileProgress[] activeFiles;
+        lock (processingOverlaySync)
+        {
+            isVisible = processingOverlay.IsVisible;
+            isActive = processingOverlay.IsActive;
+            totalFiles = processingOverlay.TotalFiles;
+            pendingFilesCount = processingOverlay.PendingFiles;
+            runningFilesCount = processingOverlay.RunningFiles;
+            succeededFiles = processingOverlay.SucceededFiles;
+            failedFiles = processingOverlay.FailedFiles;
+            maxParallel = processingOverlay.MaxParallelPipelines;
+            elapsed = processingOverlay.Elapsed;
+            summary = processingOverlay.Summary;
+            activeFiles = [.. processingOverlay.ActiveFiles];
+        }
+
+        if (!isVisible)
+            return;
+
+        sb.AppendLine("Processing Overlay:");
+        if (isActive)
+        {
+            sb.Append("Queue: ").Append(pendingFilesCount).Append('/').Append(totalFiles).Append(" pending");
+            sb.Append(" | Running: ").Append(runningFilesCount);
+            sb.Append(" | MaxParallel: ").Append(maxParallel).AppendLine();
+            sb.Append("Result: OK ").Append(succeededFiles);
+            sb.Append(" | Fail ").Append(failedFiles);
+            sb.Append(" | Elapsed ").Append(FormatElapsed(elapsed)).AppendLine();
+            foreach (var file in activeFiles.OrderBy(f => f.FileName, StringComparer.OrdinalIgnoreCase))
+                sb.Append("  ").Append(file.FileName).Append(": ").Append(file.ProgressPercent).AppendLine("%");
+            if (activeFiles.Length == 0)
+                sb.AppendLine("  Active: waiting for workers...");
+        }
+        else if (!string.IsNullOrWhiteSpace(summary))
+        {
+            sb.AppendLine(summary);
+        }
     }
 
     void ResetCamera()
@@ -583,6 +761,9 @@ public sealed class Fdia3GuiWindow : GameWindow
 
     void NavigatePreview(int delta)
     {
+        if (processingTask is not { IsCompleted: false })
+            HideProcessingOverlay();
+
         if (previewFiles.Count == 0)
         {
             status = "No preview volumes available";
@@ -627,7 +808,16 @@ public sealed class Fdia3GuiWindow : GameWindow
         var vertices = BuildPointCloudVertices(volumeData, out var loadedPointCount);
         UploadPointCloud(vertices, loadedPointCount);
         previewIndex = normalizedIndex;
+        hudFileName = ResolveHudFileName(previewFilePath, volumeData);
         return true;
+    }
+
+    static string ResolveHudFileName(string previewFilePath, VolumeProcessor.VolumeData volumeData)
+    {
+        if (!string.IsNullOrWhiteSpace(volumeData.SourceFileName))
+            return Path.GetFileName(volumeData.SourceFileName);
+
+        return Path.GetFileName(previewFilePath);
     }
 
     static bool TryLoadPreviewVolume(string fd3FilePath, out VolumeProcessor.VolumeData volumeData, out string? error)
@@ -703,6 +893,7 @@ public sealed class Fdia3GuiWindow : GameWindow
         UploadPointCloud(Array.Empty<float>(), 0);
         hasVolumeTexture = false;
         volumeValueScale = 1f;
+        hudFileName = "None";
     }
 
     static (float Scale, float AutoOpacity) ComputeVolumeValueScale(uint[] voxels)

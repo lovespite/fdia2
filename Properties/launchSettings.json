@@ -4,9 +4,13 @@
       "commandName": "Project",
       "commandLineArgs": "-uis2 D:/CloudMusic/*.wav"
     },
-    "fdia3": {
+    "fdia3 view": {
       "commandName": "Project",
       "commandLineArgs": "-3ug output/*.fd3"
+    },
+    "fdia3 process": {
+      "commandName": "Project",
+      "commandLineArgs": "-3ug D:/Downloads/*.*"
     }
   }
 }
