@@ -202,10 +202,17 @@ public sealed class HudControl : IDisposable
         return min + t * (max - min);
     }
 
+    static readonly SKFont s_font = new(SKTypeface.FromFamilyName("Arial"), FontSizePx);
+    static readonly SKPaint s_textPaint = new() { Color = SKColors.White, IsAntialias = true, };
+    static readonly SKPaint s_bgPaint = new() { Color = new SKColor(0, 0, 0, 160), IsAntialias = true,  }; 
+    static readonly SKPaint s_trackPaint = new() { IsAntialias = true,  Color = new SKColor(255, 255, 255, 70), };
+    static readonly SKPaint s_fillPaint = new() { IsAntialias = true, Color = new SKColor(85, 190, 255, 220), };
+    static readonly SKPaint s_thumbPaint = new() { IsAntialias = true, Color = new SKColor(240, 248, 255, 240), };
+
     static bool Contains(Vector4 rect, Vector2 point) =>
-      rect.Z > rect.X && rect.W > rect.Y
-      && point.X >= rect.X && point.X <= rect.Z
-      && point.Y >= rect.Y && point.Y <= rect.W;
+          rect.Z > rect.X && rect.W > rect.Y
+          && point.X >= rect.X && point.X <= rect.Z
+          && point.Y >= rect.Y && point.Y <= rect.W;
 
     void UpdateTextureIfNeeded()
     {
@@ -232,20 +239,14 @@ public sealed class HudControl : IDisposable
             return;
         }
 
-        using var textPaint = new SKPaint
-        {
-            Color = SKColors.White,
-            IsAntialias = true,
-        };
-        using var font = new SKFont(SKTypeface.Default, FontSizePx);
-        var metrics = font.Metrics;
+        var metrics = s_font.Metrics;
         var lineHeight = MathF.Ceiling(metrics.Descent - metrics.Ascent + LineSpacingPx);
         float maxLineWidth = 0f;
         foreach (var line in lines)
-            maxLineWidth = Math.Max(maxLineWidth, font.MeasureText(line));
+            maxLineWidth = Math.Max(maxLineWidth, s_font.MeasureText(line));
 
         // Cap HUD width to prevent excessive stretching with long paths/strings
-        maxLineWidth = 320f;
+        maxLineWidth = 400f;
 
         var sliderCount = sliders.Length;
         var sliderTrackWidth = Math.Max(190f, maxLineWidth);
@@ -262,36 +263,17 @@ public sealed class HudControl : IDisposable
         using (var canvas = new SKCanvas(bitmap))
         {
             canvas.Clear(SKColors.Transparent);
-            using var bgPaint = new SKPaint
-            {
-                Color = new SKColor(0, 0, 0, 160),
-                IsAntialias = true,
-            };
-            canvas.DrawRoundRect(new SKRect(0, 0, width, height), CornerRadiusPx, CornerRadiusPx, bgPaint);
+            canvas.DrawRoundRect(new SKRect(0, 0, width, height), CornerRadiusPx, CornerRadiusPx, s_bgPaint);
 
             var baseline = PaddingPx - metrics.Ascent;
             for (int i = 0; i < lines.Length; i++)
             {
-                canvas.DrawText(lines[i], PaddingPx, baseline + i * lineHeight, SKTextAlign.Left, font, textPaint);
+                canvas.DrawText(lines[i], PaddingPx, baseline + i * lineHeight, SKTextAlign.Left, s_font, s_textPaint);
             }
 
             if (sliderCount > 0)
             {
-                using var trackPaint = new SKPaint
-                {
-                    IsAntialias = true,
-                    Color = new SKColor(255, 255, 255, 70),
-                };
-                using var fillPaint = new SKPaint
-                {
-                    IsAntialias = true,
-                    Color = new SKColor(85, 190, 255, 220),
-                };
-                using var thumbPaint = new SKPaint
-                {
-                    IsAntialias = true,
-                    Color = new SKColor(240, 248, 255, 240),
-                };
+
 
                 var sliderLeft = PaddingPx;
                 var sliderTop = PaddingPx + lines.Length * lineHeight + SliderSectionGapPx;
@@ -300,7 +282,7 @@ public sealed class HudControl : IDisposable
                 for (int i = 0; i < sliders.Length; i++)
                 {
                     var s = sliders[i];
-                    var hitRect = DrawSlider(canvas, font, textPaint, trackPaint, fillPaint, thumbPaint,
+                    var hitRect = DrawSlider(canvas, s_font, s_textPaint, s_trackPaint, s_fillPaint, s_thumbPaint,
                         s.Label, s.Value, s.Min, s.Max,
                         sliderLeft, nextSliderTop, sliderWidth, sliderLabelHeight);
                     var rectPx = new Vector4(

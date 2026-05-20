@@ -20,6 +20,15 @@ public sealed class ProcessingOverlayControl : IDisposable
     const float OverlayWidthPx = 380f;
     const int MaxActiveRows = 8;
 
+    readonly SKPaint textPaint = new() { Color = SKColors.White, IsAntialias = true };
+    readonly SKPaint subPaint = new() { Color = new SKColor(210, 210, 220), IsAntialias = true };
+    readonly SKPaint trackPaint = new() { Color = new SKColor(255, 255, 255, 60), IsAntialias = true };
+    readonly SKPaint fillPaint = new() { Color = new SKColor(85, 190, 255, 230), IsAntialias = true };
+    readonly SKPaint doneFillPaint = new() { Color = new SKColor(120, 215, 130, 230), IsAntialias = true };
+    readonly SKPaint failFillPaint = new() { Color = new SKColor(230, 90, 90, 230), IsAntialias = true };
+    readonly SKFont titleFont = new(SKTypeface.Default, TitleFontSizePx);
+    readonly SKFont rowFont = new(SKTypeface.Default, FontSizePx);
+
     public sealed class State
     {
         public bool IsVisible { get; init; }
@@ -150,7 +159,7 @@ public sealed class ProcessingOverlayControl : IDisposable
         GL.Disable(EnableCap.Blend);
         GL.Enable(EnableCap.DepthTest);
     }
-
+     
     void UpdateTextureIfNeeded()
     {
         if (!dirty) return;
@@ -163,16 +172,6 @@ public sealed class ProcessingOverlayControl : IDisposable
             textureHeight = 0;
             return;
         }
-
-        using var textPaint = new SKPaint { Color = SKColors.White, IsAntialias = true };
-        using var subPaint = new SKPaint { Color = new SKColor(210, 210, 220), IsAntialias = true };
-        using var trackPaint = new SKPaint { Color = new SKColor(255, 255, 255, 60), IsAntialias = true };
-        using var fillPaint = new SKPaint { Color = new SKColor(85, 190, 255, 230), IsAntialias = true };
-        using var doneFillPaint = new SKPaint { Color = new SKColor(120, 215, 130, 230), IsAntialias = true };
-        using var failFillPaint = new SKPaint { Color = new SKColor(230, 90, 90, 230), IsAntialias = true };
-
-        using var titleFont = new SKFont(SKTypeface.Default, TitleFontSizePx);
-        using var rowFont = new SKFont(SKTypeface.Default, FontSizePx);
         var titleMetrics = titleFont.Metrics;
         var rowMetrics = rowFont.Metrics;
         var titleLineH = MathF.Ceiling(titleMetrics.Descent - titleMetrics.Ascent + LineSpacingPx);
@@ -332,5 +331,14 @@ public sealed class ProcessingOverlayControl : IDisposable
         if (vao != 0) { GL.DeleteVertexArray(vao); vao = 0; }
         if (shaderProgram != 0) { GL.DeleteProgram(shaderProgram); shaderProgram = 0; }
         if (textureId != 0) { GL.DeleteTexture(textureId); textureId = 0; }
+
+        textPaint.Dispose();
+        subPaint.Dispose();
+        trackPaint.Dispose();
+        fillPaint.Dispose();
+        doneFillPaint.Dispose();
+        failFillPaint.Dispose();
+        titleFont.Dispose();
+        rowFont.Dispose();
     }
 }
