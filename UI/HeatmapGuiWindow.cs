@@ -29,7 +29,7 @@ public sealed class HeatmapGuiWindow : GameWindow
     : base(
         new GameWindowSettings
         {
-          UpdateFrequency = 120,
+          UpdateFrequency = 60,
         },
         new NativeWindowSettings
         {
@@ -54,7 +54,7 @@ public sealed class HeatmapGuiWindow : GameWindow
     else
       status = "Drag files into this window, then press F5";
 
-    UpdateWindowTitle();
+    UpdateWindowTitle(true);
   }
 
   protected override void OnResize(ResizeEventArgs e)
@@ -69,14 +69,14 @@ public sealed class HeatmapGuiWindow : GameWindow
     pendingFiles.AddRange(e.FileNames);
     status = $"{pendingFiles.Count} file(s) queued";
     Console.WriteLine($"Queued {e.FileNames.Length} file(s) from drag & drop.");
-    UpdateWindowTitle();
+    UpdateWindowTitle(true);
   }
 
   protected override void OnUpdateFrame(FrameEventArgs args)
   {
     base.OnUpdateFrame(args);
     UpdateProcessingStatus();
-    UpdateWindowTitle();
+    UpdateWindowTitle(false);
   }
 
   protected override void OnRenderFrame(FrameEventArgs args)
@@ -200,13 +200,20 @@ public sealed class HeatmapGuiWindow : GameWindow
     }
   }
 
-  void UpdateWindowTitle()
+  void UpdateWindowTitle() => UpdateWindowTitle(false);
+
+  void UpdateWindowTitle(bool force)
   {
     var isBusy = processingTask is { IsCompleted: false } ? "Yes" : "No";
     var previewStatus = previewFiles.Count > 0 && previewIndex >= 0
       ? $"{previewIndex + 1}/{previewFiles.Count}"
       : "None";
-    Title = $"fdia2 | Mode: {HeatmapProcessor.ColorMode} | Scale: {HeatmapProcessor.Scale}x{HeatmapProcessor.Scale} | Pending: {pendingFiles.Count} | Preview: {previewStatus} | Busy: {isBusy} | {status}";
+    var nextTitle = $"fdia2 | Mode: {HeatmapProcessor.ColorMode} | Scale: {HeatmapProcessor.Scale}x{HeatmapProcessor.Scale} | Pending: {pendingFiles.Count} | Preview: {previewStatus} | Busy: {isBusy} | {status}";
+    
+    if (force || !string.Equals(Title, nextTitle, StringComparison.Ordinal))
+    {
+      Title = nextTitle;
+    }
   }
 
   void NavigatePreview(int delta)

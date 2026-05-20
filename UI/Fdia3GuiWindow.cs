@@ -116,7 +116,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     : base(
         new GameWindowSettings
         {
-          UpdateFrequency = 120,
+          UpdateFrequency = 60,
         },
         new NativeWindowSettings
         {
@@ -147,7 +147,7 @@ public sealed class Fdia3GuiWindow : GameWindow
     else
       status = "Drag files into this window, then press F5";
 
-    UpdateWindowTitle();
+    UpdateWindowTitle(true);
   }
 
   protected override void OnResize(ResizeEventArgs e)
@@ -162,14 +162,14 @@ public sealed class Fdia3GuiWindow : GameWindow
     pendingFiles.AddRange(e.FileNames);
     status = $"{pendingFiles.Count} file(s) queued";
     Console.WriteLine($"Queued {e.FileNames.Length} file(s) from drag & drop.");
-    UpdateWindowTitle();
+    UpdateWindowTitle(true);
   }
 
   protected override void OnUpdateFrame(FrameEventArgs args)
   {
     base.OnUpdateFrame(args);
     UpdateProcessingStatus();
-    UpdateWindowTitle();
+    UpdateWindowTitle(false);
   }
 
   protected override void OnRenderFrame(FrameEventArgs args)
@@ -530,16 +530,21 @@ public sealed class Fdia3GuiWindow : GameWindow
     }
   }
 
-  void UpdateWindowTitle()
+  void UpdateWindowTitle() => UpdateWindowTitle(false);
+
+  void UpdateWindowTitle(bool force)
   {
     var nextHudText = BuildHudText();
-    if (!string.Equals(hudText, nextHudText, StringComparison.Ordinal))
+    if (force || !string.Equals(hudText, nextHudText, StringComparison.Ordinal))
     {
       hudText = nextHudText;
       hudTextDirty = true;
     }
 
-    Title = BaseWindowTitle;
+    if (force || !string.Equals(Title, BaseWindowTitle, StringComparison.Ordinal))
+    {
+      Title = BaseWindowTitle;
+    }
   }
 
   string BuildHudText()
@@ -549,25 +554,24 @@ public sealed class Fdia3GuiWindow : GameWindow
       ? $"{previewIndex + 1}/{previewFiles.Count}"
       : "None";
     var clipState = clippingEnabled ? $"On@{clipOffset:F2}" : "Off";
-    var lines = new List<string>
-    {
-      $"Mode: {renderMode}",
-      $"Dens: {densityGain:F2} | Opac: {opacityGain:F2} (Auto x{autoOpacityMultiplier:F1})",
-      $"Clip: {clipState}",
-      $"Pending: {pendingFiles.Count} | Preview: {previewStatus}",
-      $"Points: {pointCount:N0} | Busy: {isBusy}",
-      $"Origin(0,0,0): ({ReferenceOrigin.X:F1},{ReferenceOrigin.Y:F1},{ReferenceOrigin.Z:F1})",
-      $"Status: {status}",
-      "Keys: F1-F4 Mode | C Clip | [ ] ClipOffset | B BG",
-      "      , . Density | - = Opacity | <- -> Preview | R Reset",
-    };
+
+    var sb = new System.Text.StringBuilder(512);
+    sb.Append("Mode: ").Append(renderMode).AppendLine();
+    sb.Append("Dens: ").Append(densityGain.ToString("F2")).Append(" | Opac: ").Append(opacityGain.ToString("F2")).Append(" (Auto x").Append(autoOpacityMultiplier.ToString("F1")).AppendLine(")");
+    sb.Append("Clip: ").Append(clipState).AppendLine();
+    sb.Append("Pending: ").Append(pendingFiles.Count).Append(" | Preview: ").Append(previewStatus).AppendLine();
+    sb.Append("Points: ").Append(pointCount.ToString("N0")).Append(" | Busy: ").Append(isBusy).AppendLine();
+    sb.Append("Origin(0,0,0): (").Append(ReferenceOrigin.X.ToString("F1")).Append(',').Append(ReferenceOrigin.Y.ToString("F1")).Append(',').Append(ReferenceOrigin.Z.ToString("F1")).AppendLine(")");
+    sb.Append("Status: ").Append(status).AppendLine();
+    sb.AppendLine("Keys: F1-F4 Mode | C Clip | [ ] ClipOffset | B BG");
+    sb.AppendLine("      , . Density | - = Opacity | <- -> Preview | R Reset");
 
     if (renderMode == RenderMode.VolumeComposite || renderMode == RenderMode.VolumeHybrid)
-      lines.Add("Composite sliders: drag Density/Opacity bars below");
+      sb.Append("Composite sliders: drag Density/Opacity bars below");
     else if (renderMode == RenderMode.VolumeMip)
-      lines.Add("MIP slider: drag Slice bar below");
+      sb.Append("MIP slider: drag Slice bar below");
 
-    return string.Join(Environment.NewLine, lines);
+    return sb.ToString();
   }
 
   void ResetCamera()
@@ -1177,20 +1181,36 @@ public sealed class Fdia3GuiWindow : GameWindow
     var pixelData = bitmap.GetPixelSpan().ToArray();
     GL.BindTexture(TextureTarget.Texture2D, hudTextureId);
     GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
-    GL.TexImage2D(
-      TextureTarget.Texture2D,
-      0,
-      PixelInternalFormat.Rgba,
-      width,
-      height,
-      0,
-      PixelFormat.Rgba,
-      PixelType.UnsignedByte,
-      pixelData);
-    GL.BindTexture(TextureTarget.Texture2D, 0);
 
-    hudTextureWidth = width;
-    hudTextureHeight = height;
+    if (width == hudTextureWidth && height == hudTextureHeight)
+    {
+      GL.TexSubImage2D(
+        TextureTarget.Texture2D,
+        0,
+        0,
+        0,
+        width,
+        height,
+        PixelFormat.Rgba,
+        PixelType.UnsignedByte,
+        pixelData);
+    }
+    else
+    {
+      GL.TexImage2D(
+        TextureTarget.Texture2D,
+        0,
+        PixelInternalFormat.Rgba,
+        width,
+        height,
+        0,
+        PixelFormat.Rgba,
+        PixelType.UnsignedByte,
+        pixelData);
+      hudTextureWidth = width;
+      hudTextureHeight = height;
+    }
+    GL.BindTexture(TextureTarget.Texture2D, 0);
   }
 
   static SKRect DrawHudSlider(SKCanvas canvas,
